@@ -17,7 +17,7 @@ public class BurpDedupeExtension implements BurpExtension {
 
     @Override
     public void initialize(MontoyaApi api) {
-        api.extension().setName("Dedupe");
+        api.extension().setName("Deduplighter");
 
         DedupeEngine engine = new DedupeEngine(api, SignatureConfig.forPreset(SignatureConfig.Preset.DEFAULT));
         AtomicBoolean enabled = new AtomicBoolean(true);
@@ -38,7 +38,7 @@ public class BurpDedupeExtension implements BurpExtension {
 
         SwingUtilities.invokeLater(() -> {
             DedupeTab tab = new DedupeTab(api, engine, enabled, colorize, preserveNotes, stamper);
-            api.userInterface().registerSuiteTab("Dedupe", tab.component());
+            api.userInterface().registerSuiteTab("Deduplighter", tab.component());
             api.userInterface().registerContextMenuItemsProvider(
                     new DedupeContextMenu(api, engine, stamper, tab::currentOverrides));
             if (tab.isAutoStampEnabled()) {

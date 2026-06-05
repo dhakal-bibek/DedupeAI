@@ -73,7 +73,7 @@ public final class DedupeContextMenu implements ContextMenuItemsProvider {
             return List.of();
         }
 
-        JMenu submenu = new JMenu("Dedupe");
+        JMenu submenu = new JMenu("Deduplighter");
 
         JMenuItem showUnique = new JMenuItem(
                 "Show only unique requests (" + selected.size() + " selected)");

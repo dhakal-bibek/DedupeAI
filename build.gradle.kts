@@ -6,7 +6,7 @@ group = "io.sw33tlie.burp"
 // Version comes from -Pversion= passed by the release workflow (derived from the git tag).
 // Local builds fall back to a snapshot so the jar name is still meaningful.
 version = (project.findProperty("version") as String?)?.takeIf { it.isNotBlank() && it != "unspecified" }
-    ?: "0.1.0-SNAPSHOT"
+    ?: "2.0.0-SNAPSHOT"
 
 repositories {
     mavenCentral()
@@ -28,10 +28,10 @@ tasks.withType<JavaCompile> {
 }
 
 tasks.jar {
-    archiveBaseName.set("burp-dedupe")
+    archiveBaseName.set("deduplighter")
     manifest {
         attributes(
-            "Implementation-Title" to "Burp Dedupe",
+            "Implementation-Title" to "Deduplighter",
             "Implementation-Version" to project.version
         )
     }

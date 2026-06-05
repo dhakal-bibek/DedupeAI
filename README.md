@@ -1,4 +1,4 @@
-# Port Highlighter + Dedupe
+# Deduplighter
 
 Burp Suite extension (Montoya API) that **color-codes proxy traffic by listener port** (attacker / victim tagging, with header injection) **and deduplicates** HTTP history — classifying each new entry as **UNIQUE** or **DUPE**, writing the verdict to the Notes column, with a filterable, Burp-history-style unique-requests viewer.
 
@@ -35,13 +35,13 @@ JAVA_HOME=/opt/homebrew/Cellar/openjdk@21/21.0.9/libexec/openjdk.jdk/Contents/Ho
   ./gradlew build
 ```
 
-Output: `build/libs/burp-dedupe-0.1.0.jar`
+Output: `build/libs/deduplighter-2.0.0.jar`
 
 ## Install in Burp
 
 1. Burp → **Extensions** → **Installed** → **Add**
 2. Extension type: **Java**
-3. Select `build/libs/burp-dedupe-0.1.0.jar`
+3. Select `build/libs/deduplighter-2.0.0.jar`
 4. A new **Dedupe** tab appears at the top.
 
 ## Usage
