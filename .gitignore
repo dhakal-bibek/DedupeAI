@@ -1,3 +1,6 @@
-*.pyc
-__pycache__/
-.DS_Store
+.gradle/
+build/
+.idea/
+*.iml
+.vscode/
+out/
