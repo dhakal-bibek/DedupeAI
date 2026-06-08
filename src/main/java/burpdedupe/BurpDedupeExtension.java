@@ -1,0 +1,64 @@
+package burpdedupe;
+
+import burp.api.montoya.BurpExtension;
+import burp.api.montoya.MontoyaApi;
+import burp.api.montoya.ui.hotkey.HotKeyContext;
+import burp.api.montoya.ui.hotkey.HotKeyHandler;
+import burpdedupe.core.DedupeEngine;
+import burpdedupe.core.SignatureConfig;
+import burpdedupe.proxy.DedupeProxyHandler;
+import burpdedupe.proxy.HistoryStamper;
+import burpdedupe.proxy.PortHighlightHandler;
+import burpdedupe.ui.DedupeContextMenu;
+import burpdedupe.ui.DedupeTab;
+
+import javax.swing.SwingUtilities;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+public class BurpDedupeExtension implements BurpExtension {
+
+    @Override
+    public void initialize(MontoyaApi api) {
+        api.extension().setName("Dedupe");
+
+        DedupeEngine engine = new DedupeEngine(api, SignatureConfig.forPreset(SignatureConfig.Preset.DEFAULT));
+        AtomicBoolean enabled = new AtomicBoolean(true);
+        AtomicBoolean colorize = new AtomicBoolean(true);
+        AtomicBoolean preserveNotes = new AtomicBoolean(true);
+
+        DedupeProxyHandler proxyHandler = new DedupeProxyHandler(api, engine, enabled, colorize, preserveNotes);
+        api.proxy().registerResponseHandler(proxyHandler);
+
+        // Port-based highlighting + header injection (attacker/victim tagging by listener port).
+        api.proxy().registerRequestHandler(new PortHighlightHandler(api));
+        PortHighlightHandler.PORT_RULES.forEach((port, rule) ->
+                api.logging().logToOutput("[burp-dedupe] port " + port + " -> unique="
+                        + rule.uniqueColor().displayName() + " dupe=" + rule.dupeColor().displayName()
+                        + " " + rule.headers()));
+
+        HistoryStamper stamper = new HistoryStamper(api, engine, colorize, preserveNotes);
+
+        SwingUtilities.invokeLater(() -> {
+            DedupeTab tab = new DedupeTab(api, engine, enabled, colorize, preserveNotes, stamper);
+            api.userInterface().registerSuiteTab("Dedupe", tab.component());
+
+            DedupeContextMenu contextMenu = new DedupeContextMenu(api, engine, stamper, tab::currentOverrides);
+            api.userInterface().registerContextMenuItemsProvider(contextMenu);
+
+            // Ctrl+9 (in Proxy HTTP history or the Site map) opens the LIVE unique-requests window,
+            // which auto-collects every [DEDUPE] UNIQUE row and keeps updating — no selection needed.
+            HotKeyHandler launchLiveUnique = event -> contextMenu.openLiveUnique();
+            api.userInterface().registerHotKeyHandler(HotKeyContext.PROXY_HTTP_HISTORY, "Ctrl+9", launchLiveUnique);
+            api.userInterface().registerHotKeyHandler(HotKeyContext.SITE_MAP_CONTENTS_TABLE, "Ctrl+9", launchLiveUnique);
+
+            if (tab.isAutoStampEnabled()) {
+                tab.startHistoryStamp();
+            }
+        });
+
+        api.extension().registerUnloadingHandler(() ->
+                api.logging().logToOutput("[burp-dedupe] unloaded"));
+
+        api.logging().logToOutput("[burp-dedupe] loaded. Default preset: " + engine.config().preset);
+    }
+}
