@@ -53,7 +53,7 @@ Output: `build/libs/burp-dedupe-0.1.0.jar`
 Select rows, right-click → **Dedupe**:
 
 - **Show only unique requests** — opens a separate window styled like Burp's HTTP history: columns for `# / Host / Method / URL / Status / Length / MIME / Notes`, rows tinted by their Burp **highlight color** (so attacker=green / victim=red / other=yellow carry over), the **Notes** column showing the `[DEDUPE] …` verdict + `[attacker]/[victim] port N` tag, and read-only request/response viewers beneath. Burp's API can't filter its own history table, so the deduplicated set is shown here instead. (Out-of-scope/static `SKIP` rows and known duplicates are excluded.)
-  - This is a **snapshot** of the current selection. For an auto-updating view, use the **Live unique window** (below) or press **Ctrl+9**.
+  - This is a **snapshot** of the current selection. For an auto-updating view, use the **Dedupe Live** tab or the **Live unique window** (below, **Ctrl+9**).
   - The table is **multi-select** (Ctrl/Cmd- or Shift-click). Toolbar actions apply to the whole selection.
   - **Send to Repeater** — sends each selected request to a new Repeater tab, **named by its method + path** (e.g. `GET /test/lasd/something/234`, `POST /sdfsd/dff`) so tabs are easy to tell apart. (Tip: point [Autorize](https://github.com/Quitten/Autorize) at Repeater and hit Send to run its authz checks.)
   - **Save request(s)** — saves all selected requests **and their responses into one `.http` file** (each in its own `####` section); pick the destination in the save dialog.
@@ -65,13 +65,22 @@ Select rows, right-click → **Dedupe**:
 
 > Note: if Autorize is enabled and intercepting **Proxy** traffic, your proxied unique requests are already being tested automatically — the button is for pushing a specific request on demand.
 
-## Live unique window (auto-collects `[DEDUPE] UNIQUE` from history)
+## Live unique view — the **Dedupe Live** tab (or Ctrl+9 window)
 
-Press **Ctrl+9** in **HTTP history** (or the **Site map**), or click **Live unique window ▶** on the **Dedupe** tab — no selection needed. It opens a real-time, HTTP-history-style view that **automatically collects every Proxy HTTP-history entry stamped `[DEDUPE] UNIQUE`** in its Notes — and only those. New uniques appear on their own as you browse (the window polls history ~1×/sec); the duplicates Burp already folded away (`[DEDUPE] DUPE …`) never show, and uniques already in history are collected the moment you open it. It carries the full toolbar (Send to Repeater, Save, Magic Cookie, Match & Replace, filter), so you can act on the deduped set live.
+Two ways in, same real-time view — **no selection needed**:
+
+- **Dedupe Live** — an always-on Burp suite tab (next to **Dedupe**); it's there the moment the extension loads.
+- **Ctrl+9** in **HTTP history** / the **Site map**, or **Live unique window ▶** on the **Dedupe** tab — opens the same view as a separate window.
+
+It's an HTTP-history-style view that **automatically collects every Proxy HTTP-history entry stamped `[DEDUPE] UNIQUE`** in its Notes — and only those. New uniques appear on their own as you browse (it refreshes a couple of times a second, scanning history **incrementally** so it stays smooth even when history is large); the duplicates Burp already folded away (`[DEDUPE] DUPE …`) never show, and uniques already in history are collected the moment you open it.
+
+The toolbar acts on the multi-selected rows: **Send to Repeater**, **In-scope only** (keep only rows whose URL is in Target scope), **Save**, **Magic Cookie**, **Match & Replace**, **Clear**, **Live export → file**, and a **filter** box (substring or regex).
+
+**Inline repeater:** select a row to load it into the **editable** request editor beneath the table, tweak it, then **Send ▶** — or **Ctrl+Space** / **Cmd+Enter**. The response shows on the right with a status / length / timing line, so you can modify a logged request and resend without leaving the view (it uses Burp's HTTP client, so it lands in **Logger**, not Proxy history). On macOS, Ctrl+Space may be reserved for input-source switching — use **Cmd+Enter** there.
 
 - It **re-reads the verdict the proxy handler already wrote** — it does *not* re-deduplicate. So keep **verdict stamping enabled** (that's what writes the `[DEDUPE]` note); with stamping off, nothing is collected.
-- It also picks up rows that the **Stamp existing history** pass marks `UNIQUE` after the window is already open.
-- Why a separate window: Burp's own HTTP history already shows these notes live, but the Montoya API can't *filter* that table to just the `UNIQUE` rows — so this window does. Closing it stops the polling.
+- It also picks up rows that the **Stamp existing history** pass marks `UNIQUE` after the view is already open.
+- Why a dedicated view: Burp's own HTTP history already shows these notes live, but the Montoya API can't *filter* that table to just the `UNIQUE` rows — so this view does. (The tab lives for the session; closing the Ctrl+9 window stops that window's polling.)
 
 ## Live export to a file (for Claude Code / AI)
 
@@ -85,7 +94,7 @@ Burp's MCP server can't see a custom extension window, so to hand your deduped r
 
 The folder is named after the **current Burp project** (`api.project().name()`), so each engagement gets its own. Each entry is the request **and** its response in a `####`-delimited block, with a header line (project / time / count). The toggle is **on by default in the live window** (off in snapshot/results windows so they don't overwrite the files — flip it on there for a one-off).
 
-**Workflow:** open **Dedupe — Live unique history** (Ctrl+9) → it fills with `[DEDUPE] UNIQUE` requests and mirrors them automatically → in **Claude Code**: *"read `~/.burp-dedupe/<project>/live-unique.http`"* for the full deduped set, or `selection.http` for just what you've highlighted. The folder path is logged to the extension's **Output** on open and shown in the **status bar** after each write.
+**Workflow:** open the **Dedupe Live** tab (or the Ctrl+9 window) → it fills with `[DEDUPE] UNIQUE` requests and mirrors them automatically → in **Claude Code**: *"read `~/.burp-dedupe/<project>/live-unique.http`"* for the full deduped set, or `selection.http` for just what you've highlighted. The folder path is logged to the extension's **Output** on open and shown in the **status bar** after each write.
 
 ## Presets
 

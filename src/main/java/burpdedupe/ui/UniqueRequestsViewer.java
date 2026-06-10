@@ -15,9 +15,12 @@ import burp.api.montoya.ui.editor.HttpRequestEditor;
 import burp.api.montoya.ui.editor.HttpResponseEditor;
 import burpdedupe.proxy.DedupeProxyHandler;
 
+import javax.swing.AbstractAction;
 import javax.swing.BorderFactory;
+import javax.swing.InputMap;
 import javax.swing.JButton;
 import javax.swing.JCheckBox;
+import javax.swing.JComponent;
 import javax.swing.JDialog;
 import javax.swing.JFileChooser;
 import javax.swing.JFrame;
@@ -25,6 +28,7 @@ import javax.swing.JLabel;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
+import javax.swing.KeyStroke;
 import javax.swing.JSplitPane;
 import javax.swing.JTable;
 import javax.swing.JTextArea;
@@ -48,6 +52,9 @@ import java.awt.Font;
 import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
 import java.awt.Insets;
+import java.awt.Toolkit;
+import java.awt.event.ActionEvent;
+import java.awt.event.KeyEvent;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
 import java.io.File;
@@ -85,21 +92,30 @@ import java.util.regex.PatternSyntaxException;
 final class UniqueRequestsViewer {
 
     private final MontoyaApi api;
-    private final List<HttpRequestResponse> uniques;
     private final String baseTitle;
     private final HttpRequestEditor requestEditor;
     private final HttpResponseEditor responseEditor;
     private final UniqueTableModel model;
     private final JTable table;
-    private final JFrame frame;
+    private final JFrame frame;          // null in embedded (Burp suite-tab) mode
+    private final JPanel root;           // the content panel; becomes the tab body when embedded
     private final TableRowSorter<UniqueTableModel> sorter;
     private final JTextField filterField = new JTextField(26);
     private final JCheckBox regexBox = new JCheckBox("regex");
+    private final JCheckBox inScopeBox = new JCheckBox("In-scope only");
     private final JLabel status = new JLabel(" ");
     /** Live mode: ids of Proxy-history entries already collected (so polling never re-adds one). */
     private final Set<Integer> seenIds = new HashSet<>();
+    /** Live mode: ids examined and found NOT unique — skipped on later ticks; cleared periodically for late stamps. */
+    private final Set<Integer> examinedNonUnique = new HashSet<>();
+    private int ticksUntilFullRescan = FULL_RESCAN_TICKS;
     private final AtomicBoolean polling = new AtomicBoolean(false);
     private Timer liveTimer;
+    /** Consecutive live-poll failures; a stale API (extension reloaded) trips a self-stop. */
+    private volatile int liveFailures = 0;
+    private static final int MAX_LIVE_FAILURES = 3;
+    private static final int POLL_INTERVAL_MS = 600;   // snappy live feed without hammering api.proxy().history()
+    private static final int FULL_RESCAN_TICKS = 50;   // ~every 30s re-examine all entries (catches "Stamp history")
 
     /** Live export: mirror every collected unique request to a file Claude Code can read. */
     private final JCheckBox cbLiveExport = new JCheckBox("Live export → file", false);
@@ -112,13 +128,22 @@ final class UniqueRequestsViewer {
 
     /** @param title the window subtitle, e.g. "Unique requests" or "Magic Cookie results". */
     UniqueRequestsViewer(MontoyaApi api, List<HttpRequestResponse> uniques, String title) {
+        this(api, uniques, title, true);
+    }
+
+    /**
+     * @param windowed {@code true} shows this in its own {@link JFrame} (the pop-up result windows and
+     *                 the Ctrl+9 live window); {@code false} builds only the content panel for
+     *                 embedding as a Burp suite tab — see {@link #component()} and {@link #embedLive}.
+     */
+    private UniqueRequestsViewer(MontoyaApi api, List<HttpRequestResponse> uniques, String title, boolean windowed) {
         this.api = api;
-        this.uniques = new ArrayList<>(uniques);
         this.baseTitle = title;
-        this.requestEditor = api.userInterface().createHttpRequestEditor(EditorOptions.READ_ONLY);
+        this.requestEditor = api.userInterface().createHttpRequestEditor(); // editable — inline repeater
         this.responseEditor = api.userInterface().createHttpResponseEditor(EditorOptions.READ_ONLY);
 
-        this.model = new UniqueTableModel(this.uniques);
+        this.model = new UniqueTableModel();
+        seedRows(uniques);  // precompute cells off the render path (EDT here, but seeds are small/empty)
         this.table = new JTable(model);
         this.sorter = new TableRowSorter<>(model);
         table.setRowSorter(sorter);
@@ -137,29 +162,60 @@ final class UniqueRequestsViewer {
                 requestEditor.uiComponent(), responseEditor.uiComponent());
         editors.setResizeWeight(0.5);
 
+        // Inline repeater: edit the request (left), Send, see the response (right) — no pop-up.
+        JButton sendEdited = new JButton("Send ▶  (Ctrl+Space / Cmd+Enter)");
+        sendEdited.setToolTipText("<html>Send the request as edited on the left; the response shows on the right.<br>"
+                + "Shortcuts: <b>Ctrl+Space</b>, <b>Ctrl+Enter</b>, or <b>Cmd+Enter</b>.<br>"
+                + "macOS may reserve Ctrl+Space for input-source switching — use <b>Cmd+Enter</b> there "
+                + "(or free Ctrl+Space in System Settings → Keyboard → Keyboard Shortcuts → Input Sources).<br>"
+                + "Uses Burp's HTTP client, so it lands in Logger, not Proxy history.</html>");
+        sendEdited.addActionListener(e -> sendEditedRequest());
+        JPanel sendBar = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 2));
+        sendBar.add(new JLabel("Repeater:"));
+        sendBar.add(sendEdited);
+        JPanel editorPanel = new JPanel(new BorderLayout());
+        editorPanel.add(sendBar, BorderLayout.NORTH);
+        editorPanel.add(editors, BorderLayout.CENTER);
+        installSendKeys(editorPanel);          // Ctrl+Space / Ctrl+Enter / Cmd+Enter → Send
+
         JSplitPane main = new JSplitPane(JSplitPane.VERTICAL_SPLIT,
-                new JScrollPane(table), editors);
+                new JScrollPane(table), editorPanel);
         main.setResizeWeight(0.35);
 
         status.setBorder(BorderFactory.createEmptyBorder(4, 8, 4, 8));
 
-        JPanel root = new JPanel(new BorderLayout());
+        this.root = new JPanel(new BorderLayout());
         root.add(buildToolbar(), BorderLayout.NORTH);
         root.add(main, BorderLayout.CENTER);
         root.add(status, BorderLayout.SOUTH);
 
-        this.frame = new JFrame("Dedupe — " + baseTitle + " (" + this.uniques.size() + ")");
-        frame.setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
-        frame.add(root);
-        frame.setSize(1150, 760);
-        frame.setLocationRelativeTo(null);
-        api.userInterface().applyThemeToComponent(frame.getRootPane());
+        if (windowed) {
+            this.frame = new JFrame("Dedupe — " + baseTitle + " (" + model.getRowCount() + ")");
+            frame.setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
+            frame.add(root);
+            frame.setSize(1150, 760);
+            frame.setLocationRelativeTo(null);
+            api.userInterface().applyThemeToComponent(frame.getRootPane());
+        } else {
+            this.frame = null;                               // embedded: this panel is a Burp suite tab
+            api.userInterface().applyThemeToComponent(root);
+        }
 
-        if (!this.uniques.isEmpty()) {
+        if (model.getRowCount() != 0) {
             table.setRowSelectionInterval(0, 0); // shows the first request immediately
         }
         updateCount();
-        frame.setVisible(true);
+        if (frame != null) frame.setVisible(true);
+    }
+
+    /** The content panel — used when this viewer is embedded as a Burp suite tab ({@link #embedLive}). */
+    Component component() {
+        return root;
+    }
+
+    /** Updates the pop-up window title with the live count; a no-op when embedded as a Burp tab. */
+    private void refreshTitle() {
+        if (frame != null) frame.setTitle("Dedupe — " + baseTitle + " (" + model.getRowCount() + ")");
     }
 
     private JPanel buildToolbar() {
@@ -205,9 +261,14 @@ final class UniqueRequestsViewer {
         });
         regexBox.setToolTipText("Treat the filter text as a regular expression (case-insensitive).");
         regexBox.addItemListener(e -> applyFilter());
+        inScopeBox.setToolTipText("Show only requests whose URL is in Burp's Target scope. "
+                + "Combines with the filter box; live rows are scoped as they arrive. "
+                + "(Toggle to re-apply after changing scope.)");
+        inScopeBox.addItemListener(e -> applyFilter());
 
         JPanel bar = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 4));
         bar.add(repeater);
+        bar.add(inScopeBox);
         bar.add(save);
         bar.add(magic);
         bar.add(matchReplace);
@@ -219,25 +280,58 @@ final class UniqueRequestsViewer {
         return bar;
     }
 
-    /** Filters the table across all columns: substring by default, regex when ticked. Case-insensitive. */
+    /**
+     * Filters the table: an optional <b>In-scope only</b> gate (request URL in Burp's Target scope)
+     * AND the text box, which matches across all columns — substring by default, regex when ticked,
+     * always case-insensitive. With neither active, every row shows.
+     */
     private void applyFilter() {
-        String text = filterField.getText();
-        if (text == null || text.isEmpty()) {
-            sorter.setRowFilter(null);
-            updateCount();
-            return;
+        List<RowFilter<Object, Object>> filters = new ArrayList<>(2);
+
+        if (inScopeBox.isSelected()) {
+            filters.add(scopeRowFilter());
         }
+
+        String text = filterField.getText();
+        if (text != null && !text.isEmpty()) {
+            try {
+                String regex = regexBox.isSelected() ? text : Pattern.quote(text);
+                filters.add(RowFilter.regexFilter("(?i)" + regex));
+            } catch (PatternSyntaxException ex) {
+                status.setText("Invalid regex: " + ex.getMessage());
+                return; // leave the previous filter in place rather than clearing it
+            }
+        }
+
+        sorter.setRowFilter(filters.isEmpty() ? null
+                : filters.size() == 1 ? filters.get(0)
+                : RowFilter.andFilter(filters));
+        updateCount();
+    }
+
+    /** A row filter that keeps only rows whose request URL is in Burp's Target scope. */
+    private RowFilter<Object, Object> scopeRowFilter() {
+        return new RowFilter<>() {
+            @Override public boolean include(Entry<? extends Object, ? extends Object> entry) {
+                Object id = entry.getIdentifier();
+                return id instanceof Integer && rowInScope((Integer) id);
+            }
+        };
+    }
+
+    /** True iff the model row's request URL is in Burp's Target scope. Uses the row's cached URL. */
+    private boolean rowInScope(int modelRow) {
+        String url = model.urlAt(modelRow);
+        if (url == null || url.isEmpty()) return false;
         try {
-            String regex = regexBox.isSelected() ? text : Pattern.quote(text);
-            sorter.setRowFilter(RowFilter.regexFilter("(?i)" + regex));
-            updateCount();
-        } catch (PatternSyntaxException ex) {
-            status.setText("Invalid regex: " + ex.getMessage());
+            return api.scope().isInScope(url);
+        } catch (RuntimeException e) {
+            return false;
         }
     }
 
     private void updateCount() {
-        status.setText("Showing " + table.getRowCount() + " of " + uniques.size() + " request(s).");
+        status.setText("Showing " + table.getRowCount() + " of " + model.getRowCount() + " request(s).");
     }
 
     /**
@@ -247,34 +341,45 @@ final class UniqueRequestsViewer {
      */
     void addResult(HttpRequestResponse rr) {
         if (rr == null) return;
-        int idx = uniques.size();
-        uniques.add(rr);
-        model.fireTableRowsInserted(idx, idx);
-        frame.setTitle("Dedupe — " + baseTitle + " (" + uniques.size() + ")");
-        if (uniques.size() == 1) {
+        model.add(Row.of(rr));
+        refreshTitle();
+        if (model.getRowCount() == 1) {
             table.setRowSelectionInterval(0, 0); // show the first response the moment it lands
         }
         updateCount();
         scheduleLiveExport();
     }
 
-    /** Bulk-appends rows with a single table refresh (EDT only). Used by the live back-fill. */
-    void addResults(List<HttpRequestResponse> rows) {
+    /** Bulk-appends precomputed rows with a single table refresh (EDT only). Used by the live back-fill. */
+    void addResults(List<Row> rows) {
         if (rows == null || rows.isEmpty()) return;
-        int start = uniques.size();
-        uniques.addAll(rows);
-        model.fireTableRowsInserted(start, uniques.size() - 1);
-        frame.setTitle("Dedupe — " + baseTitle + " (" + uniques.size() + ")");
-        if (start == 0) {
+        boolean wasEmpty = model.getRowCount() == 0;
+        model.addAll(rows);
+        refreshTitle();
+        if (wasEmpty) {
             table.setRowSelectionInterval(0, 0);
         }
         updateCount();
         scheduleLiveExport();
     }
 
+    /** Seeds the table from a caller-supplied list (constructor only); cells are computed here. */
+    private void seedRows(List<HttpRequestResponse> seed) {
+        if (seed == null || seed.isEmpty()) return;
+        List<Row> rows = new ArrayList<>(seed.size());
+        for (HttpRequestResponse rr : seed) {
+            if (rr != null) rows.add(Row.of(rr));
+        }
+        model.addAll(rows);
+    }
+
     /** Routes an event line to Burp's extension output (the in-window live log was removed). */
     void log(String line) {
-        api.logging().logToOutput("[burp-dedupe] " + line);
+        try {
+            api.logging().logToOutput("[burp-dedupe] " + line);
+        } catch (RuntimeException ignored) {
+            // API gone (extension unloaded) — drop the line rather than crash the worker
+        }
     }
 
     /**
@@ -282,10 +387,9 @@ final class UniqueRequestsViewer {
      * next poll — only genuinely new {@code [DEDUPE] UNIQUE} entries arrive.
      */
     private void clearView() {
-        int n = uniques.size();
-        uniques.clear();
-        model.fireTableDataChanged();
-        frame.setTitle("Dedupe — " + baseTitle + " (0)");
+        int n = model.getRowCount();
+        model.clear();
+        refreshTitle();
         status.setText("Cleared " + n + " row(s).");
         scheduleLiveExport();
     }
@@ -309,60 +413,122 @@ final class UniqueRequestsViewer {
         return viewer;
     }
 
+    /**
+     * Builds the same live unique history as {@link #openLive}, but as an embeddable panel (no pop-up)
+     * for registration as a Burp suite tab — get it via {@link #component()}. Polls Proxy history for
+     * {@code [DEDUPE] UNIQUE} rows for the life of the extension. Must be called on the Swing EDT.
+     */
+    static UniqueRequestsViewer embedLive(MontoyaApi api) {
+        UniqueRequestsViewer viewer = new UniqueRequestsViewer(api, new ArrayList<>(), "Live unique history", false);
+        viewer.startLivePolling();
+        return viewer;
+    }
+
     private void startLivePolling() {
         log("Live unique history — auto-collecting [DEDUPE] UNIQUE entries from HTTP history…");
         cbLiveExport.setSelected(true);  // the live window auto-exports every unique by default
         scheduleLiveExport();            // create the (initially empty) export file right away
-        liveTimer = new Timer(1000, e -> pollHistory());
+        liveTimer = new Timer(POLL_INTERVAL_MS, e -> pollHistory());
         liveTimer.setRepeats(true);
         liveTimer.start();
         pollHistory(); // immediate first pass picks up the uniques already in history
 
-        frame.addWindowListener(new WindowAdapter() {
-            @Override public void windowClosed(WindowEvent e) {
+        if (frame != null) {                 // window mode: stop polling when the pop-up closes
+            frame.addWindowListener(new WindowAdapter() {
+                @Override public void windowClosed(WindowEvent e) {
+                    if (liveTimer != null) liveTimer.stop();
+                }
+            });
+        }
+
+        // If the extension is unloaded/reloaded while this view is still alive, the MontoyaApi goes
+        // stale (api.proxy() becomes null) and every tick would NPE forever. Stop polling and, in
+        // window mode, dispose the now-orphaned pop-up the moment that happens.
+        try {
+            api.extension().registerUnloadingHandler(() -> SwingUtilities.invokeLater(() -> {
                 if (liveTimer != null) liveTimer.stop();
-            }
-        });
+                if (frame != null) frame.dispose();
+            }));
+        } catch (RuntimeException ignored) {
+            // best-effort; the per-poll self-stop is the safety net if this can't register
+        }
     }
 
     /**
      * Appends any Proxy-history entry whose Notes start with {@code [DEDUPE] UNIQUE} that we haven't
-     * already collected. Re-scans the whole history each tick (cheap) so it also catches entries the
-     * "Stamp existing history" pass marks unique <em>after</em> the window is open. Runs off the EDT
-     * and never overlaps itself.
+     * already collected. <b>Incremental:</b> ids already collected ({@code seenIds}) or already examined
+     * and rejected ({@code examinedNonUnique}) are skipped with a cheap set lookup, so a steady tick only
+     * does real work for genuinely new entries. Every {@link #FULL_RESCAN_TICKS} ticks the reject set is
+     * cleared for one full re-examine, which catches rows the "Stamp existing history" pass marks unique
+     * after the window opened. Each kept row's display cells are computed <em>here, off the EDT</em>
+     * ({@link Row#of}), so the table never parses while painting. Runs off the EDT and never overlaps.
      */
     private void pollHistory() {
         if (!polling.compareAndSet(false, true)) return; // a scan is already in flight
         Thread t = new Thread(() -> {
             try {
+                if (--ticksUntilFullRescan <= 0) {       // periodic full re-examine (late "Stamp history" marks)
+                    examinedNonUnique.clear();
+                    ticksUntilFullRescan = FULL_RESCAN_TICKS;
+                }
                 List<ProxyHttpRequestResponse> history = api.proxy().history();
-                List<HttpRequestResponse> batch = new ArrayList<>();
+                liveFailures = 0; // a good read clears the stale-API failure streak
+                List<Row> batch = new ArrayList<>();
                 for (ProxyHttpRequestResponse h : history) {
                     if (h == null || h.request() == null) continue;
-                    if (seenIds.contains(h.id())) continue;          // already collected
-                    if (!isDedupeUnique(h.annotations())) continue;  // not (yet) a [DEDUPE] UNIQUE row
-                    seenIds.add(h.id());
+                    int id = h.id();
+                    if (seenIds.contains(id) || examinedNonUnique.contains(id)) continue; // already handled
+                    if (!isDedupeUnique(h.annotations())) { examinedNonUnique.add(id); continue; }
+                    seenIds.add(id);
                     HttpResponse resp = h.hasResponse() && h.response() != null ? h.response() : HttpResponse.httpResponse();
-                    batch.add(HttpRequestResponse.httpRequestResponse(h.request(), resp, h.annotations()));
+                    batch.add(Row.of(HttpRequestResponse.httpRequestResponse(h.request(), resp, h.annotations())));
                 }
                 if (!batch.isEmpty()) {
                     SwingUtilities.invokeLater(() -> {
                         addResults(batch);
                         if (batch.size() <= 12) {
-                            for (HttpRequestResponse rr : batch) log("UNIQUE  " + safeReqLine(rr.request()));
+                            for (Row r : batch) log("UNIQUE  " + safeReqLine(r.rr.request()));
                         } else {
                             log("Added " + batch.size() + " [DEDUPE] UNIQUE from history.");
                         }
                     });
                 }
             } catch (RuntimeException ex) {
-                api.logging().logToError("[burp-dedupe] live history poll failed: " + ex);
+                handleLivePollFailure(ex);
             } finally {
                 polling.set(false);
             }
         }, "burp-dedupe-live-poll");
         t.setDaemon(true);
         t.start();
+    }
+
+    /**
+     * A live poll threw — almost always because the {@link MontoyaApi} went stale (the extension was
+     * unloaded/reloaded with this window still open), which makes {@code api.proxy()} null and would
+     * otherwise NPE on every 1s tick forever. Log it safely (the API's logger may be dead too) and,
+     * once a few consecutive ticks have failed, stop the timer so the window goes quiet instead of
+     * flooding the error log. A later good read resets the streak.
+     */
+    private void handleLivePollFailure(RuntimeException ex) {
+        int fails = ++liveFailures;
+        safeLogError("[burp-dedupe] live history poll failed (" + fails + "/" + MAX_LIVE_FAILURES + "): " + ex);
+        if (fails >= MAX_LIVE_FAILURES) {
+            SwingUtilities.invokeLater(() -> {
+                if (liveTimer != null) liveTimer.stop();
+                status.setText("Live polling stopped — Burp API unavailable (extension reloaded?). "
+                        + "Reopen the live window to resume.");
+            });
+        }
+    }
+
+    /** Logs to Burp's error output, falling back to stderr if the API is gone (e.g. after unload). */
+    private void safeLogError(String msg) {
+        try {
+            api.logging().logToError(msg);
+        } catch (RuntimeException ignored) {
+            System.err.println(msg);
+        }
     }
 
     /** True iff these annotations' Notes start with {@code [DEDUPE] UNIQUE}. */
@@ -377,11 +543,73 @@ final class UniqueRequestsViewer {
     }
 
     private void showRow(int modelRow) {
-        if (modelRow < 0 || modelRow >= uniques.size()) return;
-        HttpRequestResponse rr = uniques.get(modelRow);
+        Row row = model.rowAt(modelRow);
+        if (row == null || row.rr == null) return;
+        HttpRequestResponse rr = row.rr;
         requestEditor.setRequest(rr.request());
         responseEditor.setResponse(
                 rr.hasResponse() && rr.response() != null ? rr.response() : HttpResponse.httpResponse());
+    }
+
+    /**
+     * Inline repeater: sends whatever is currently in the (editable) request editor — including the
+     * user's edits — via Burp's HTTP client, then shows the response on the right with a status /
+     * length / timing line. Select a logged row to load it, tweak the request, then Send. Runs off the
+     * EDT; reissued requests appear in Logger, not Proxy history (like Magic Cookie / Match &amp; Replace).
+     */
+    private void sendEditedRequest() {
+        HttpRequest req;
+        try {
+            req = requestEditor.getRequest();
+        } catch (RuntimeException ex) {
+            status.setText("Couldn't read the edited request: " + ex.getMessage());
+            return;
+        }
+        if (req == null || req.httpService() == null) {
+            status.setText("Select a row first, then edit the request and Send.");
+            return;
+        }
+        status.setText("Sending…");
+        Thread t = new Thread(() -> {
+            long t0 = System.currentTimeMillis();
+            try {
+                HttpRequestResponse out = api.http().sendRequest(req);
+                long ms = System.currentTimeMillis() - t0;
+                HttpResponse resp = out != null && out.hasResponse() ? out.response() : null;
+                SwingUtilities.invokeLater(() -> {
+                    responseEditor.setResponse(resp != null ? resp : HttpResponse.httpResponse());
+                    status.setText(resp != null
+                            ? "HTTP " + resp.statusCode() + "  •  " + resp.body().length() + " bytes  •  " + ms + " ms"
+                            : "No response (" + ms + " ms).");
+                });
+                log("Repeater  " + safeReqLine(req) + "   ←   "
+                        + (resp != null ? resp.statusCode() + " " + resp.body().length() + "b" : "(no response)"));
+            } catch (RuntimeException ex) {
+                SwingUtilities.invokeLater(() -> status.setText("Send failed: " + ex.getMessage()));
+                api.logging().logToError("[burp-dedupe] inline repeater send failed: " + ex);
+            }
+        }, "burp-dedupe-repeater-send");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /**
+     * Binds <b>Send</b> to Ctrl+Space, Ctrl+Enter and Cmd/Ctrl+Enter at the window level, so it fires
+     * while focus is in the request editor (or anywhere in this view) and only while this view is on
+     * screen ({@code root.isShowing()} — so it never triggers from another Burp tab). macOS reserves
+     * Ctrl+Space for input-source switching, so <b>Cmd+Enter</b> is offered as a reliable alternative.
+     */
+    private void installSendKeys(JComponent c) {
+        c.getActionMap().put("dedupe-send", new AbstractAction() {
+            @Override public void actionPerformed(ActionEvent e) {
+                if (root.isShowing()) sendEditedRequest();
+            }
+        });
+        InputMap im = c.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW);
+        im.put(KeyStroke.getKeyStroke(KeyEvent.VK_SPACE, KeyEvent.CTRL_DOWN_MASK), "dedupe-send");
+        im.put(KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, KeyEvent.CTRL_DOWN_MASK), "dedupe-send");
+        im.put(KeyStroke.getKeyStroke(KeyEvent.VK_ENTER,
+                Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx()), "dedupe-send"); // Cmd+Enter on macOS
     }
 
     /** All currently selected rows (in view order), skipping nulls. Empty if nothing is selected. */
@@ -389,8 +617,8 @@ final class UniqueRequestsViewer {
         int[] viewRows = table.getSelectedRows();
         List<HttpRequestResponse> out = new ArrayList<>(viewRows.length);
         for (int vr : viewRows) {
-            HttpRequestResponse rr = uniques.get(table.convertRowIndexToModel(vr));
-            if (rr != null) out.add(rr);
+            Row row = model.rowAt(table.convertRowIndexToModel(vr));
+            if (row != null && row.rr != null) out.add(row.rr);
         }
         return out;
     }
@@ -814,7 +1042,7 @@ final class UniqueRequestsViewer {
      */
     private void liveExportNow() {
         if (!cbLiveExport.isSelected()) return;
-        List<HttpRequestResponse> all = new ArrayList<>(uniques); // every collected unique (EDT)
+        List<HttpRequestResponse> all = model.requests();         // every collected unique (EDT)
         List<HttpRequestResponse> sel = selectedRows();           // current selection (EDT)
         Path dir = exportDir();
         String project = exportProjectName();
@@ -875,7 +1103,7 @@ final class UniqueRequestsViewer {
         return (base.isBlank() ? "request" : base) + ".http";
     }
 
-    /** Null/exception-safe accessor for a String field used only in status text. */
+    /** Null/exception-safe String accessor used when precomputing row cells and for status text. */
     private static String safe(java.util.function.Supplier<String> get) {
         try {
             String v = get.get();
@@ -934,49 +1162,38 @@ final class UniqueRequestsViewer {
         };
     }
 
-    /** Burp-history-like columns. All cells are Strings so column sorting/filtering is safe. */
-    private static final class UniqueTableModel extends AbstractTableModel {
-        private static final String[] COLS = {"#", "Host", "Method", "URL", "Status", "Length", "MIME", "Notes"};
-        private final List<HttpRequestResponse> rows;
+    /**
+     * One captured row with its display cells, highlight colour and URL precomputed <em>off the EDT</em>
+     * (in {@link #of}). The table then paints from plain fields and never parses a Montoya request or
+     * response — which is what keeps scrolling and filtering buttery under a fast live feed.
+     */
+    private static final class Row {
+        final HttpRequestResponse rr;
+        final String[] cells;          // indices 1..7 used; column 0 ("#") is the live row number
+        final HighlightColor color;
+        final String url;              // cached for the In-scope filter (no per-keystroke re-parse)
 
-        UniqueTableModel(List<HttpRequestResponse> rows) { this.rows = rows; }
-
-        @Override public int getRowCount() { return rows.size(); }
-        @Override public int getColumnCount() { return COLS.length; }
-        @Override public String getColumnName(int c) { return COLS[c]; }
-        @Override public boolean isCellEditable(int r, int c) { return false; }
-
-        HighlightColor highlightAt(int modelRow) {
-            if (modelRow < 0 || modelRow >= rows.size()) return HighlightColor.NONE;
-            try {
-                Annotations a = rows.get(modelRow).annotations();
-                HighlightColor h = a == null ? null : a.highlightColor();
-                return h == null ? HighlightColor.NONE : h;
-            } catch (RuntimeException e) {
-                return HighlightColor.NONE;
-            }
+        private Row(HttpRequestResponse rr, String[] cells, HighlightColor color, String url) {
+            this.rr = rr;
+            this.cells = cells;
+            this.color = color;
+            this.url = url;
         }
 
-        @Override
-        public Object getValueAt(int r, int c) {
-            HttpRequestResponse rr = rows.get(r);
+        /** Parses everything the table shows once, here (call off the EDT for big batches). */
+        static Row of(HttpRequestResponse rr) {
             HttpRequest req = rr.request();
             boolean hasResp = rr.hasResponse() && rr.response() != null;
-            try {
-                return switch (c) {
-                    case 0 -> Integer.toString(r + 1);
-                    case 1 -> req != null && req.httpService() != null ? req.httpService().host() : "";
-                    case 2 -> req != null ? req.method() : "";
-                    case 3 -> req != null ? req.path() : "";
-                    case 4 -> hasResp ? Short.toString(rr.response().statusCode()) : "";
-                    case 5 -> hasResp ? Integer.toString(rr.response().body().length()) : "";
-                    case 6 -> hasResp ? mimeOf(rr.response()) : "";
-                    case 7 -> notesOf(rr);
-                    default -> "";
-                };
-            } catch (RuntimeException ex) {
-                return "";
-            }
+            String[] c = new String[UniqueTableModel.COLS.length];
+            c[1] = safe(() -> req != null && req.httpService() != null ? req.httpService().host() : "");
+            c[2] = safe(() -> req != null ? req.method() : "");
+            c[3] = safe(() -> req != null ? req.path() : "");
+            c[4] = safe(() -> hasResp ? Short.toString(rr.response().statusCode()) : "");
+            c[5] = safe(() -> hasResp ? Integer.toString(rr.response().body().length()) : "");
+            c[6] = safe(() -> hasResp ? mimeOf(rr.response()) : "");
+            c[7] = safe(() -> notesOf(rr));
+            String url = safe(() -> req != null ? req.url() : "");
+            return new Row(rr, c, colorOf(rr), url);
         }
 
         private static String mimeOf(HttpResponse resp) {
@@ -995,6 +1212,71 @@ final class UniqueRequestsViewer {
             } catch (RuntimeException e) {
                 return "";
             }
+        }
+
+        private static HighlightColor colorOf(HttpRequestResponse rr) {
+            try {
+                Annotations a = rr.annotations();
+                HighlightColor h = a == null ? null : a.highlightColor();
+                return h == null ? HighlightColor.NONE : h;
+            } catch (RuntimeException e) {
+                return HighlightColor.NONE;
+            }
+        }
+    }
+
+    /** Burp-history-like columns backed by precomputed {@link Row}s — {@code getValueAt} never parses. */
+    private static final class UniqueTableModel extends AbstractTableModel {
+        private static final String[] COLS = {"#", "Host", "Method", "URL", "Status", "Length", "MIME", "Notes"};
+        private final List<Row> rows = new ArrayList<>();
+
+        Row rowAt(int r) { return r >= 0 && r < rows.size() ? rows.get(r) : null; }
+
+        HighlightColor highlightAt(int modelRow) {
+            Row row = rowAt(modelRow);
+            return row == null ? HighlightColor.NONE : row.color;
+        }
+
+        String urlAt(int modelRow) {
+            Row row = rowAt(modelRow);
+            return row == null ? null : row.url;
+        }
+
+        /** Snapshot of the backing requests (for Save / live export). */
+        List<HttpRequestResponse> requests() {
+            List<HttpRequestResponse> out = new ArrayList<>(rows.size());
+            for (Row r : rows) out.add(r.rr);
+            return out;
+        }
+
+        void add(Row row) {
+            int i = rows.size();
+            rows.add(row);
+            fireTableRowsInserted(i, i);
+        }
+
+        void addAll(List<Row> batch) {
+            if (batch.isEmpty()) return;
+            int start = rows.size();
+            rows.addAll(batch);
+            fireTableRowsInserted(start, rows.size() - 1);
+        }
+
+        void clear() {
+            rows.clear();
+            fireTableDataChanged();
+        }
+
+        @Override public int getRowCount() { return rows.size(); }
+        @Override public int getColumnCount() { return COLS.length; }
+        @Override public String getColumnName(int c) { return COLS[c]; }
+        @Override public boolean isCellEditable(int r, int c) { return false; }
+
+        @Override
+        public Object getValueAt(int r, int c) {
+            if (c == 0) return Integer.toString(r + 1);
+            Row row = rowAt(r);
+            return row == null ? "" : row.cells[c];
         }
     }
 }

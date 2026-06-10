@@ -94,6 +94,14 @@ public final class DedupeTab {
 
     public Component component() { return component; }
 
+    /**
+     * Builds the embedded <b>Live unique history</b> panel for registration as its own Burp suite tab
+     * (always-on; same live feed as the Ctrl+9 pop-up, no separate window). Must be called on the EDT.
+     */
+    public static Component liveUniqueComponent(MontoyaApi api) {
+        return UniqueRequestsViewer.embedLive(api).component();
+    }
+
     /** Snapshot accessor for the context menu — never null, may be {@link HeaderOverrideSet#empty()}. */
     public HeaderOverrideSet currentOverrides() {
         return overridesRef.get();
