@@ -5,6 +5,7 @@ import burpdedupe.core.DedupeEngine;
 import burpdedupe.core.HeaderOverrideSet;
 import burpdedupe.core.SignatureConfig;
 import burpdedupe.proxy.HistoryStamper;
+import burpdedupe.proxy.UniqueFeed;
 
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
@@ -98,8 +99,8 @@ public final class DedupeTab {
      * Builds the embedded <b>Live unique history</b> panel for registration as its own Burp suite tab
      * (always-on; same live feed as the Ctrl+9 pop-up, no separate window). Must be called on the EDT.
      */
-    public static Component liveUniqueComponent(MontoyaApi api) {
-        return UniqueRequestsViewer.embedLive(api).component();
+    public static Component liveUniqueComponent(MontoyaApi api, UniqueFeed feed) {
+        return UniqueRequestsViewer.embedLive(api, feed).component();
     }
 
     /** Snapshot accessor for the context menu — never null, may be {@link HeaderOverrideSet#empty()}. */
@@ -108,6 +109,8 @@ public final class DedupeTab {
     }
 
     private Component build() {
+        installTooltips();
+
         JPanel root = new JPanel(new BorderLayout(8, 8));
         root.setBorder(new EmptyBorder(12, 12, 12, 12));
 
@@ -168,7 +171,11 @@ public final class DedupeTab {
 
         // Buttons
         JButton btnApply = new JButton("Apply (resets seen-set)");
+        btnApply.setToolTipText("<html>Commit the Signature fields / filters / cap above to the engine.<br>"
+                + "<b>Required for any change to take effect.</b> It <b>clears the seen-set</b>, so counts restart "
+                + "and live stamping re-classifies from scratch (keeps verdicts consistent).</html>");
         JButton btnReset = new JButton("Reset stats");
+        btnReset.setToolTipText("Zero the counters and clear the seen-set, without changing the signature config.");
         JButton btnLiveUnique = new JButton("Live unique window ▶");
         btnLiveUnique.setToolTipText("Open a live, HTTP-history-style window showing only unique requests — "
                 + "back-filled from history, then deduplicated in real time as you browse (Logger-style).");
@@ -254,9 +261,15 @@ public final class DedupeTab {
 
         // Wiring
         presetBox.addActionListener(e -> {
+            if (loading) return; // ignore the programmatic selection made by loadFromEngine
             SignatureConfig.Preset p = (SignatureConfig.Preset) presetBox.getSelectedItem();
             if (p != null && p != SignatureConfig.Preset.CUSTOM) {
-                loadFromEngine(SignatureConfig.forPreset(p));
+                loading = true;  // fill the fields from the preset without flipping back to Custom
+                try {
+                    setFieldsFromConfig(SignatureConfig.forPreset(p));
+                } finally {
+                    loading = false;
+                }
             }
         });
         btnApply.addActionListener(e -> applyToEngine());
@@ -288,8 +301,11 @@ public final class DedupeTab {
         btnStampHistory.addActionListener(e -> startHistoryStamp());
         btnCancelStamp.addActionListener(e -> stampCancel.set(true));
 
-        // Any manual field change flips preset to CUSTOM
+        // A genuine user field change flips the preset to CUSTOM — but a programmatic load (preset
+        // selection / construction) must not, or the preset would never stick. The `loading` guard
+        // distinguishes the two.
         Runnable markCustom = () -> {
+            if (loading) return;
             if (presetBox.getSelectedItem() != SignatureConfig.Preset.CUSTOM) {
                 presetBox.setSelectedItem(SignatureConfig.Preset.CUSTOM);
             }
@@ -298,8 +314,74 @@ public final class DedupeTab {
                 cbQNames, cbQValues, cbBNames, cbBValues, cbStatus, cbCType, cbScope, cbStatic}) {
             cb.addItemListener(e -> markCustom.run());
         }
+        tfHeaders.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
+            public void insertUpdate(javax.swing.event.DocumentEvent e)  { markCustom.run(); }
+            public void removeUpdate(javax.swing.event.DocumentEvent e)  { markCustom.run(); }
+            public void changedUpdate(javax.swing.event.DocumentEvent e) { markCustom.run(); }
+        });
 
         return root;
+    }
+
+    /**
+     * Hover-help for every control — a built-in manual so the signature options are self-explanatory.
+     * The <b>Signature fields</b> define what makes two requests "the same": two requests whose enabled
+     * fields all match get the same signature and the second is a <b>DUPE</b>.
+     */
+    private void installTooltips() {
+        ToolTipManager.sharedInstance().setDismissDelay(20_000); // keep the multi-line tips up long enough to read
+
+        // ── Behavior ──
+        cbEnabled.setToolTipText("<html>Classify every new proxy response and stamp its <b>Notes</b> with a "
+                + "<code>[DEDUPE] UNIQUE</code> / <code>DUPE&nbsp;xN</code> verdict.<br>"
+                + "This is what the live unique view reads — keep it on. Unticking strips our [DEDUPE] notes "
+                + "from history.</html>");
+        cbColorize.setToolTipText("<html>Tint HTTP-history rows by verdict (yellow = unique, gray = dupe; "
+                + "attacker/victim ports get their own colours).<br>Unticking clears the highlights we added.</html>");
+        cbPreserve.setToolTipText("<html>If a row already has notes from another tool, keep them: our verdict "
+                + "goes first, the original is appended after <code>&nbsp;|&nbsp;</code>.<br>"
+                + "Off = our verdict replaces the row's notes.</html>");
+        presetBox.setToolTipText("<html>Ready-made signature recipes per vuln class. Selecting one fills the "
+                + "<b>Signature fields</b> below — then click <b>Apply</b> to activate it.<br>"
+                + "Editing any field switches this to <b>Custom</b>.</html>");
+        spCap.setToolTipText("<html>Max distinct signatures held in memory. Beyond this, new requests are "
+                + "reported <code>OVRF</code> (overflow) instead of tracked, to bound memory. Takes effect on "
+                + "<b>Apply</b>.</html>");
+
+        // ── Signature fields (identical enabled fields ⇒ same signature ⇒ duplicate) ──
+        cbMethod.setToolTipText("<html>Include the HTTP <b>method</b>. On: <code>GET /x</code> and "
+                + "<code>POST /x</code> are different; off: they collide into one signature.</html>");
+        cbScheme.setToolTipText("Include <b>http vs https</b> in the signature.");
+        cbHost.setToolTipText("<html>Include the target <b>host</b>. Off: the same path on different hosts is "
+                + "treated as one request.</html>");
+        cbPort.setToolTipText("Include the <b>port</b> — useful when one host serves different apps per port.");
+        cbPath.setToolTipText("<html>Include the URL <b>path</b> (without query). Almost always on — off "
+                + "collapses every path together.</html>");
+        cbNormIds.setToolTipText("<html>Collapse id-like path segments so <code>/users/1</code> and "
+                + "<code>/users/2</code> share a signature:<br>digits→<code>{n}</code>, "
+                + "UUIDs→<code>{uuid}</code>, long hex→<code>{hex}</code>.<br>"
+                + "Ideal for <b>IDOR</b> — one row per endpoint, not per id.</html>");
+        cbQNames.setToolTipText("<html>Include the set of <b>query-string parameter names</b> (sorted, so order "
+                + "doesn't matter). Off = the query string is ignored entirely.</html>");
+        cbQValues.setToolTipText("<html>Also include each query parameter's <b>value</b>, so <code>?id=1</code> "
+                + "and <code>?id=2</code> are different. Ticking this includes the names too.</html>");
+        cbBNames.setToolTipText("<html>Include the set of <b>body parameter names</b> (form / JSON / XML / "
+                + "multipart), sorted. Also folds in cookie names.</html>");
+        cbBValues.setToolTipText("<html>Also include each body parameter's <b>value</b> (same form, different "
+                + "values ⇒ different signature). Ticking this includes the names too.</html>");
+        cbStatus.setToolTipText("<html>Include the response <b>status code</b> — the same request returning "
+                + "200 vs 403 counts as two signatures. Needs a response.</html>");
+        cbCType.setToolTipText("<html>Include the response <b>Content-Type</b> (charset stripped), e.g. "
+                + "<code>application/json</code>. Needs a response.</html>");
+
+        // ── Filters ──
+        cbScope.setToolTipText("<html>Only classify requests whose URL is in Burp's <b>Target scope</b>; "
+                + "everything else is marked <code>SKIP</code> and ignored.</html>");
+        cbStatic.setToolTipText("<html>Skip css / js / images / fonts / media by extension — marked "
+                + "<code>SKIP</code> so they don't fill the unique set.</html>");
+        tfHeaders.setToolTipText("<html>Comma-separated, lowercase <b>header names</b> to fold into the "
+                + "signature (e.g. <code>x-api-version, accept</code>). Each listed header's value is included; "
+                + "blank = none.</html>");
     }
 
     private static TitledBorder titled(String t) {
@@ -316,7 +398,17 @@ public final class DedupeTab {
     }
 
     private void loadFromEngine(SignatureConfig cfg) {
-        presetBox.setSelectedItem(cfg.preset);
+        loading = true;             // suppress markCustom while we set controls programmatically
+        try {
+            presetBox.setSelectedItem(cfg.preset);
+            setFieldsFromConfig(cfg);
+        } finally {
+            loading = false;
+        }
+    }
+
+    /** Sets the signature-field / filter checkboxes + headers from a config; leaves the preset box alone. */
+    private void setFieldsFromConfig(SignatureConfig cfg) {
         cbMethod.setSelected(cfg.includeMethod);
         cbScheme.setSelected(cfg.includeScheme);
         cbHost.setSelected(cfg.includeHost);
@@ -538,4 +630,6 @@ public final class DedupeTab {
 
     private boolean lastLoggedEnabled = false;
     private int lastLoggedCount = -1;
+    /** True while we set controls programmatically (preset load / construction) — suppresses markCustom. */
+    private boolean loading = false;
 }

@@ -10,7 +10,9 @@ import burp.api.montoya.proxy.http.ProxyRequestReceivedAction;
 import burp.api.montoya.proxy.http.ProxyRequestToBeSentAction;
 import burpdedupe.core.DedupeEngine;
 
+import java.util.LinkedHashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -86,6 +88,31 @@ public final class PortHighlightHandler implements ProxyRequestHandler {
     /** Same, parsing the port from a proxy listener interface like "127.0.0.1:8082". */
     public static HighlightColor colorFor(String listenerInterface, DedupeEngine.Verdict verdict) {
         return colorFor(parsePort(listenerInterface), verdict);
+    }
+
+    // ── Role ports (attacker/victim) — cross-identity dedupe ──────────────────
+
+    /** True if this listener port is one of the tagged role ports (attacker/victim). */
+    public static boolean isRolePort(int port) {
+        return PORT_RULES.containsKey(port);
+    }
+
+    /** Same, parsing the port from a listener interface like "127.0.0.1:8082". */
+    public static boolean isRolePort(String listenerInterface) {
+        return isRolePort(parsePort(listenerInterface));
+    }
+
+    /**
+     * Every header name this handler injects across the role ports (e.g. {@code X-AI-Use}). The dedupe
+     * engine strips these before computing a cross-identity signature, so the attacker/victim tag never
+     * splits the count.
+     */
+    public static Set<String> injectedHeaderNames() {
+        Set<String> names = new LinkedHashSet<>();
+        for (PortRule r : PORT_RULES.values()) {
+            names.addAll(r.headers().keySet());
+        }
+        return names;
     }
 
     // ── Header injection (request side) ──────────────────────────────────────

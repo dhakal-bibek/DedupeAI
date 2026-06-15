@@ -75,12 +75,12 @@ public final class DedupeContextMenu implements ContextMenuItemsProvider {
 
         JMenu submenu = new JMenu("Dedupe");
 
-        JMenuItem liveUnique = new JMenuItem("Live unique window (auto-collects [DEDUPE] UNIQUE) — Ctrl+9");
+        JMenuItem liveUnique = new JMenuItem("Live unique window (auto-collects [DEDUPE] UNIQUE)");
         liveUnique.addActionListener(e -> openLiveUnique());
         submenu.add(liveUnique);
 
         JMenuItem showUnique = new JMenuItem(
-                "Show only unique requests from selection (" + selected.size() + ") — snapshot");
+                "Show only unique requests from selection (" + selected.size() + ") — Ctrl+9");
         showUnique.addActionListener(e -> showUniqueRequests(selected));
         submenu.add(showUnique);
 

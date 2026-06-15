@@ -3,6 +3,7 @@ package burpdedupe;
 import burp.api.montoya.BurpExtension;
 import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.core.Registration;
+import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.ui.hotkey.HotKeyContext;
 import burp.api.montoya.ui.hotkey.HotKeyHandler;
 import burpdedupe.core.DedupeEngine;
@@ -10,10 +11,12 @@ import burpdedupe.core.SignatureConfig;
 import burpdedupe.proxy.DedupeProxyHandler;
 import burpdedupe.proxy.HistoryStamper;
 import burpdedupe.proxy.PortHighlightHandler;
+import burpdedupe.proxy.UniqueFeed;
 import burpdedupe.ui.DedupeContextMenu;
 import burpdedupe.ui.DedupeTab;
 
 import javax.swing.SwingUtilities;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class BurpDedupeExtension implements BurpExtension {
@@ -27,7 +30,11 @@ public class BurpDedupeExtension implements BurpExtension {
         AtomicBoolean colorize = new AtomicBoolean(true);
         AtomicBoolean preserveNotes = new AtomicBoolean(true);
 
-        DedupeProxyHandler proxyHandler = new DedupeProxyHandler(api, engine, enabled, colorize, preserveNotes);
+        // In-memory live feed: the proxy handler publishes every UNIQUE straight to the "Dedupe Live"
+        // tab, so the tab no longer depends on re-reading [DEDUPE] notes back out of Proxy history.
+        UniqueFeed liveFeed = new UniqueFeed();
+
+        DedupeProxyHandler proxyHandler = new DedupeProxyHandler(api, engine, enabled, colorize, preserveNotes, liveFeed);
         api.proxy().registerResponseHandler(proxyHandler);
 
         // Port-based highlighting + header injection (attacker/victim tagging by listener port).
@@ -44,14 +51,22 @@ public class BurpDedupeExtension implements BurpExtension {
             api.userInterface().registerSuiteTab("Dedupe", tab.component());
 
             // Live unique history as its own always-on Burp tab (no pop-up needed; Ctrl+9 still works).
-            api.userInterface().registerSuiteTab("Dedupe Live", DedupeTab.liveUniqueComponent(api));
+            api.userInterface().registerSuiteTab("Dedupe Live", DedupeTab.liveUniqueComponent(api, liveFeed));
 
             DedupeContextMenu contextMenu = new DedupeContextMenu(api, engine, stamper, tab::currentOverrides);
             api.userInterface().registerContextMenuItemsProvider(contextMenu);
 
-            // Ctrl+9 (in Proxy HTTP history or the Site map) opens the LIVE unique-requests window,
-            // which auto-collects every [DEDUPE] UNIQUE row and keeps updating — no selection needed.
-            HotKeyHandler launchLiveUnique = event -> contextMenu.openLiveUnique();
+            // Ctrl+9 (in Proxy HTTP history or the Site map): if rows are selected (e.g. Ctrl+A),
+            // open the unique requests from that selection; with nothing selected, fall back to the
+            // LIVE window that auto-collects every [DEDUPE] UNIQUE row.
+            HotKeyHandler launchLiveUnique = event -> {
+                List<HttpRequestResponse> selected = event.selectedRequestResponses();
+                if (selected != null && !selected.isEmpty()) {
+                    contextMenu.showUniqueRequests(selected);
+                } else {
+                    contextMenu.openLiveUnique();
+                }
+            };
             Registration hkHistory = api.userInterface()
                     .registerHotKeyHandler(HotKeyContext.PROXY_HTTP_HISTORY, "Ctrl+9", launchLiveUnique);
             Registration hkSiteMap = api.userInterface()
@@ -73,6 +88,8 @@ public class BurpDedupeExtension implements BurpExtension {
                 api.logging().logToOutput("[burp-dedupe] unloaded"));
 
         api.logging().logToOutput("[burp-dedupe] loaded. Default preset: " + engine.config().preset);
+        api.logging().logToOutput("[burp-dedupe] BUILD: live-push feed enabled — Dedupe Live receives UNIQUEs "
+                + "directly from the proxy handler (history poll is back-fill only).");
     }
 
     /** Best-effort deregistration — ignores a null/already-gone registration so unload never throws. */

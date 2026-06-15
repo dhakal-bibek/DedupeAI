@@ -14,6 +14,7 @@ import burp.api.montoya.ui.editor.EditorOptions;
 import burp.api.montoya.ui.editor.HttpRequestEditor;
 import burp.api.montoya.ui.editor.HttpResponseEditor;
 import burpdedupe.proxy.DedupeProxyHandler;
+import burpdedupe.proxy.UniqueFeed;
 
 import javax.swing.AbstractAction;
 import javax.swing.BorderFactory;
@@ -65,9 +66,12 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Predicate;
 import java.util.function.UnaryOperator;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
@@ -104,10 +108,14 @@ final class UniqueRequestsViewer {
     private final JCheckBox regexBox = new JCheckBox("regex");
     private final JCheckBox inScopeBox = new JCheckBox("In-scope only");
     private final JLabel status = new JLabel(" ");
-    /** Live mode: ids of Proxy-history entries already collected (so polling never re-adds one). */
-    private final Set<Integer> seenIds = new HashSet<>();
+    /** Live mode: proxy ids already collected, by either path (so neither push nor poll re-adds one). Concurrent: written from the proxy thread (push) and the poll thread. */
+    private final Set<Integer> seenIds = ConcurrentHashMap.newKeySet();
+    /** Live mode: cross-path dedup by request identity — guards against push/poll double-add and re-stamps that change the proxy id. */
+    private final Set<String> liveKeys = ConcurrentHashMap.newKeySet();
     /** Live mode: ids examined and found NOT unique — skipped on later ticks; cleared periodically for late stamps. */
     private final Set<Integer> examinedNonUnique = new HashSet<>();
+    /** Live mode: unsubscribe from the push feed on dispose/unload (null for the on-demand pop-up). */
+    private Runnable feedUnsub;
     private int ticksUntilFullRescan = FULL_RESCAN_TICKS;
     private final AtomicBoolean polling = new AtomicBoolean(false);
     private Timer liveTimer;
@@ -252,8 +260,9 @@ final class UniqueRequestsViewer {
         cbLiveExport.addActionListener(e -> { if (cbLiveExport.isSelected()) scheduleLiveExport(); });
         api.logging().logToOutput("[burp-dedupe] live export dir: " + exportDir + " (live-unique.http, selection.http)");
 
-        filterField.setToolTipText("Filter rows across all columns (Host / Method / URL / Status / MIME / Notes). "
-                + "Plain substring; tick 'regex' for a regular expression.");
+        filterField.setToolTipText("Filter by any text in the request (path, query, headers, body), the "
+                + "response body, or the columns (Host / Method / URL / Status / MIME / Notes). "
+                + "Plain substring; tick 'regex' for a case-insensitive regular expression.");
         filterField.getDocument().addDocumentListener(new DocumentListener() {
             @Override public void insertUpdate(DocumentEvent e) { applyFilter(); }
             @Override public void removeUpdate(DocumentEvent e) { applyFilter(); }
@@ -294,12 +303,17 @@ final class UniqueRequestsViewer {
 
         String text = filterField.getText();
         if (text != null && !text.isEmpty()) {
-            try {
-                String regex = regexBox.isSelected() ? text : Pattern.quote(text);
-                filters.add(RowFilter.regexFilter("(?i)" + regex));
-            } catch (PatternSyntaxException ex) {
-                status.setText("Invalid regex: " + ex.getMessage());
-                return; // leave the previous filter in place rather than clearing it
+            if (regexBox.isSelected()) {
+                try {
+                    Pattern p = Pattern.compile(text, Pattern.CASE_INSENSITIVE);
+                    filters.add(searchRowFilter(blob -> p.matcher(blob).find()));
+                } catch (PatternSyntaxException ex) {
+                    status.setText("Invalid regex: " + ex.getMessage());
+                    return; // leave the previous filter in place rather than clearing it
+                }
+            } else {
+                String needle = text.toLowerCase(Locale.ROOT);
+                filters.add(searchRowFilter(blob -> blob.contains(needle)));
             }
         }
 
@@ -307,6 +321,22 @@ final class UniqueRequestsViewer {
                 : filters.size() == 1 ? filters.get(0)
                 : RowFilter.andFilter(filters));
         updateCount();
+    }
+
+    /**
+     * A row filter that runs {@code test} against the row's precomputed search blob — the columns plus
+     * the full request (path, query, headers, body) and response body — so the filter matches request
+     * body and path text, not just the visible columns.
+     */
+    private RowFilter<Object, Object> searchRowFilter(Predicate<String> test) {
+        return new RowFilter<>() {
+            @Override public boolean include(Entry<? extends Object, ? extends Object> entry) {
+                Object id = entry.getIdentifier();
+                if (!(id instanceof Integer)) return true;
+                String blob = model.searchAt((Integer) id);
+                return blob != null && test.test(blob);
+            }
+        };
     }
 
     /** A row filter that keeps only rows whose request URL is in Burp's Target scope. */
@@ -418,14 +448,60 @@ final class UniqueRequestsViewer {
      * for registration as a Burp suite tab — get it via {@link #component()}. Polls Proxy history for
      * {@code [DEDUPE] UNIQUE} rows for the life of the extension. Must be called on the Swing EDT.
      */
-    static UniqueRequestsViewer embedLive(MontoyaApi api) {
+    static UniqueRequestsViewer embedLive(MontoyaApi api, UniqueFeed feed) {
         UniqueRequestsViewer viewer = new UniqueRequestsViewer(api, new ArrayList<>(), "Live unique history", false);
-        viewer.startLivePolling();
+        if (feed != null) {
+            // Primary live path: UNIQUEs are pushed here straight from the proxy handler.
+            viewer.feedUnsub = feed.subscribe(viewer::onLiveUnique);
+        }
+        viewer.startLivePolling(); // back-fill + safety net for entries that predate this view
         return viewer;
     }
 
+    /**
+     * Push path: a freshly-classified UNIQUE arrives directly from {@link DedupeProxyHandler} (on the
+     * proxy thread, off the EDT). Records the proxy id so the history back-fill won't re-add it, dedupes
+     * by request identity, parses the row off the EDT, then appends on the EDT. Never throws back into
+     * the proxy hot path.
+     */
+    private void onLiveUnique(HttpRequestResponse rr, int proxyId) {
+        try {
+            if (rr == null || rr.request() == null) return;
+            if (proxyId >= 0) seenIds.add(proxyId);   // poll will now skip this entry
+            if (!claimLive(rr)) return;               // already shown (e.g. just back-filled by the poll)
+            Row row = Row.of(rr);                      // parse off the EDT
+            SwingUtilities.invokeLater(() -> {
+                addResults(java.util.Collections.singletonList(row));
+                log("UNIQUE  " + safeReqLine(rr.request()));
+            });
+        } catch (RuntimeException e) {
+            safeLogError("[burp-dedupe] live push add failed: " + e);
+        }
+    }
+
+    /** True iff {@code rr} is new to this live view (and claims it); false if an identical row is already shown. */
+    private boolean claimLive(HttpRequestResponse rr) {
+        String key = liveKey(rr);
+        return key == null || liveKeys.add(key); // Set.add → true when newly added
+    }
+
+    /** A lightweight identity key for cross-path dedup: method + URL + request body length. */
+    private static String liveKey(HttpRequestResponse rr) {
+        try {
+            HttpRequest req = rr.request();
+            if (req == null) return null;
+            String method = req.method() == null ? "" : req.method();
+            String url = req.url() == null ? "" : req.url();
+            int bodyLen;
+            try { bodyLen = req.body() == null ? 0 : req.body().length(); } catch (RuntimeException e) { bodyLen = -1; }
+            return method + " " + url + " #" + bodyLen;
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
     private void startLivePolling() {
-        log("Live unique history — auto-collecting [DEDUPE] UNIQUE entries from HTTP history…");
+        log("Live unique history — push from the proxy handler, with a history back-fill poll…");
         cbLiveExport.setSelected(true);  // the live window auto-exports every unique by default
         scheduleLiveExport();            // create the (initially empty) export file right away
         liveTimer = new Timer(POLL_INTERVAL_MS, e -> pollHistory());
@@ -437,20 +513,31 @@ final class UniqueRequestsViewer {
             frame.addWindowListener(new WindowAdapter() {
                 @Override public void windowClosed(WindowEvent e) {
                     if (liveTimer != null) liveTimer.stop();
+                    unsubscribeFeed();
                 }
             });
         }
 
         // If the extension is unloaded/reloaded while this view is still alive, the MontoyaApi goes
-        // stale (api.proxy() becomes null) and every tick would NPE forever. Stop polling and, in
-        // window mode, dispose the now-orphaned pop-up the moment that happens.
+        // stale (api.proxy() becomes null) and every tick would NPE forever. Stop polling, drop the
+        // feed subscription, and in window mode dispose the now-orphaned pop-up the moment that happens.
         try {
             api.extension().registerUnloadingHandler(() -> SwingUtilities.invokeLater(() -> {
                 if (liveTimer != null) liveTimer.stop();
+                unsubscribeFeed();
                 if (frame != null) frame.dispose();
             }));
         } catch (RuntimeException ignored) {
             // best-effort; the per-poll self-stop is the safety net if this can't register
+        }
+    }
+
+    /** Drops the push-feed subscription (idempotent; no-op for the on-demand pop-up). */
+    private void unsubscribeFeed() {
+        Runnable u = feedUnsub;
+        feedUnsub = null;
+        if (u != null) {
+            try { u.run(); } catch (RuntimeException ignored) { /* best-effort */ }
         }
     }
 
@@ -467,21 +554,44 @@ final class UniqueRequestsViewer {
         if (!polling.compareAndSet(false, true)) return; // a scan is already in flight
         Thread t = new Thread(() -> {
             try {
+                // A "full pass" re-examines every not-yet-collected entry: true on the very first poll
+                // (the reject set is still empty) and on each periodic rescan tick. We take the verdict
+                // census on a full pass so an empty feed can explain itself.
+                boolean fullPass = examinedNonUnique.isEmpty();
                 if (--ticksUntilFullRescan <= 0) {       // periodic full re-examine (late "Stamp history" marks)
                     examinedNonUnique.clear();
                     ticksUntilFullRescan = FULL_RESCAN_TICKS;
+                    fullPass = true;
                 }
                 List<ProxyHttpRequestResponse> history = api.proxy().history();
                 liveFailures = 0; // a good read clears the stale-API failure streak
                 List<Row> batch = new ArrayList<>();
+                int nUnique = 0, nDupe = 0, nSkip = 0, nOvrf = 0, nOther = 0, nNoNote = 0;
                 for (ProxyHttpRequestResponse h : history) {
                     if (h == null || h.request() == null) continue;
                     int id = h.id();
                     if (seenIds.contains(id) || examinedNonUnique.contains(id)) continue; // already handled
-                    if (!isDedupeUnique(h.annotations())) { examinedNonUnique.add(id); continue; }
-                    seenIds.add(id);
-                    HttpResponse resp = h.hasResponse() && h.response() != null ? h.response() : HttpResponse.httpResponse();
-                    batch.add(Row.of(HttpRequestResponse.httpRequestResponse(h.request(), resp, h.annotations())));
+                    try {
+                        String cat = noteCategory(h.annotations());
+                        switch (cat) {
+                            case "UNIQUE" -> nUnique++;
+                            case "DUPE"   -> nDupe++;
+                            case "SKIP"   -> nSkip++;
+                            case "OVRF"   -> nOvrf++;
+                            case "OTHER"  -> nOther++;
+                            default       -> nNoNote++;
+                        }
+                        if (!"UNIQUE".equals(cat)) { examinedNonUnique.add(id); continue; }
+                        seenIds.add(id);
+                        HttpResponse resp = h.hasResponse() && h.response() != null ? h.response() : HttpResponse.httpResponse();
+                        HttpRequestResponse rr = HttpRequestResponse.httpRequestResponse(h.request(), resp, h.annotations());
+                        if (claimLive(rr)) batch.add(Row.of(rr)); // skip if the push path already added it
+                    } catch (RuntimeException perEntry) {
+                        // One malformed entry must never abort the whole scan — which would otherwise be
+                        // caught below as a poll "failure" and, after a few ticks, self-stop the feed.
+                        examinedNonUnique.add(id);
+                        safeLogError("[burp-dedupe] live scan skipped entry " + id + ": " + perEntry);
+                    }
                 }
                 if (!batch.isEmpty()) {
                     SwingUtilities.invokeLater(() -> {
@@ -490,6 +600,22 @@ final class UniqueRequestsViewer {
                             for (Row r : batch) log("UNIQUE  " + safeReqLine(r.rr.request()));
                         } else {
                             log("Added " + batch.size() + " [DEDUPE] UNIQUE from history.");
+                        }
+                    });
+                }
+                if (fullPass) {
+                    // Verdict census of the entries examined this pass. The live feed collects only
+                    // [DEDUPE] UNIQUE rows, so when it stays empty the reason is almost always visible
+                    // here: 0 UNIQUE because in-scope-only marked everything SKIP, no [DEDUPE] note at
+                    // all (stamping off / a duplicate extension overwrote it), or empty history.
+                    final int histSize = history.size();
+                    final int cU = nUnique, cD = nDupe, cS = nSkip, cO = nOvrf, cX = nOther, cN = nNoNote;
+                    log("live scan: " + histSize + " history entr" + (histSize == 1 ? "y" : "ies")
+                            + ", new this pass UNIQUE=" + cU + " DUPE=" + cD + " SKIP=" + cS
+                            + " OVRF=" + cO + " other=" + cX + " no-note=" + cN);
+                    SwingUtilities.invokeLater(() -> {
+                        if (model.getRowCount() == 0) {
+                            status.setText(reasonForEmpty(histSize, cU, cD, cS, cO, cX, cN));
                         }
                     });
                 }
@@ -531,15 +657,54 @@ final class UniqueRequestsViewer {
         }
     }
 
-    /** True iff these annotations' Notes start with {@code [DEDUPE] UNIQUE}. */
-    private static boolean isDedupeUnique(Annotations a) {
+    /**
+     * Categorises a history row's Notes by our verdict: {@code "UNIQUE"}, {@code "DUPE"}, {@code "SKIP"}
+     * or {@code "OVRF"}; {@code "OTHER"} for a non-dedupe note, {@code "NONE"} for no note at all. Only
+     * {@code "UNIQUE"} rows are collected by the live feed — the rest feed the diagnostic census in
+     * {@link #pollHistory}.
+     */
+    private static String noteCategory(Annotations a) {
         try {
-            if (a == null || !a.hasNotes()) return false;
+            if (a == null || !a.hasNotes()) return "NONE";
             String notes = a.notes();
-            return notes != null && notes.startsWith(DedupeProxyHandler.NOTE_PREFIX + " UNIQUE");
+            if (notes == null || notes.isEmpty()) return "NONE";
+            if (!notes.startsWith(DedupeProxyHandler.NOTE_PREFIX)) return "OTHER";
+            String rest = notes.substring(DedupeProxyHandler.NOTE_PREFIX.length()).trim();
+            if (rest.startsWith("UNIQUE")) return "UNIQUE";
+            if (rest.startsWith("DUPE"))   return "DUPE";
+            if (rest.startsWith("SKIP"))   return "SKIP";
+            if (rest.startsWith("OVRF"))   return "OVRF";
+            return "OTHER";
         } catch (RuntimeException e) {
-            return false;
+            return "NONE";
         }
+    }
+
+    /**
+     * A plain-language reason the live feed is still empty, shown in the status bar after a full scan
+     * collected nothing — turning an invisible config problem into a visible, actionable message.
+     */
+    private static String reasonForEmpty(int histSize, int unique, int dupe, int skip, int ovrf,
+                                         int other, int noNote) {
+        if (histSize == 0) {
+            return "Live: proxy history is empty — browse the target through Burp's proxy first.";
+        }
+        if (unique > 0) {
+            return "Live: found " + unique + " UNIQUE — collecting…"; // transient; next tick fills the table
+        }
+        int dedupeNotes = dupe + skip + ovrf;
+        if (dedupeNotes == 0) {
+            return "Live: " + histSize + " rows but none carry a [DEDUPE] verdict — enable "
+                    + "\"Stamp Notes column with verdict\" in the Dedupe tab (or another extension is "
+                    + "overwriting the Notes).";
+        }
+        if (skip > 0 && dupe == 0 && ovrf == 0) {
+            return "Live: 0 UNIQUE — all " + skip + " classified rows are [DEDUPE] SKIP. Turn off "
+                    + "\"In-scope only\" in the Dedupe tab (or set a matching Target scope), then Apply.";
+        }
+        return "Live: 0 UNIQUE of " + histSize + " rows (DUPE=" + dupe + " SKIP=" + skip
+                + (ovrf > 0 ? " OVRF=" + ovrf : "") + "). If you expected uniques, check for a duplicate "
+                + "Dedupe extension overwriting verdicts, then click \"Stamp existing history\".";
     }
 
     private void showRow(int modelRow) {
@@ -1168,19 +1333,22 @@ final class UniqueRequestsViewer {
      * response — which is what keeps scrolling and filtering buttery under a fast live feed.
      */
     private static final class Row {
+        private static final int MAX_SEARCH_CHARS = 16_000;  // cap the per-row search blob (bounds memory)
         final HttpRequestResponse rr;
         final String[] cells;          // indices 1..7 used; column 0 ("#") is the live row number
         final HighlightColor color;
         final String url;              // cached for the In-scope filter (no per-keystroke re-parse)
+        final String search;           // lowercased: columns + full request + some response body
 
-        private Row(HttpRequestResponse rr, String[] cells, HighlightColor color, String url) {
+        private Row(HttpRequestResponse rr, String[] cells, HighlightColor color, String url, String search) {
             this.rr = rr;
             this.cells = cells;
             this.color = color;
             this.url = url;
+            this.search = search;
         }
 
-        /** Parses everything the table shows once, here (call off the EDT for big batches). */
+        /** Parses everything the table shows (and searches) once, here (call off the EDT for big batches). */
         static Row of(HttpRequestResponse rr) {
             HttpRequest req = rr.request();
             boolean hasResp = rr.hasResponse() && rr.response() != null;
@@ -1193,7 +1361,25 @@ final class UniqueRequestsViewer {
             c[6] = safe(() -> hasResp ? mimeOf(rr.response()) : "");
             c[7] = safe(() -> notesOf(rr));
             String url = safe(() -> req != null ? req.url() : "");
-            return new Row(rr, c, colorOf(rr), url);
+            return new Row(rr, c, colorOf(rr), url, buildSearchBlob(rr, req, hasResp, c));
+        }
+
+        /**
+         * The lowercased text the filter searches: the visible columns plus the <b>full request</b>
+         * (request line, headers and body — so path, query and request body all match) and as much of
+         * the <b>response body</b> as the {@link #MAX_SEARCH_CHARS} budget allows. Built once, off the EDT.
+         */
+        private static String buildSearchBlob(HttpRequestResponse rr, HttpRequest req, boolean hasResp, String[] c) {
+            StringBuilder sb = new StringBuilder(512);
+            for (int i = 1; i < c.length; i++) {
+                if (c[i] != null && !c[i].isEmpty()) sb.append(c[i]).append('\n');
+            }
+            sb.append(safe(() -> req != null ? req.toByteArray().toString() : ""));
+            if (hasResp && sb.length() < MAX_SEARCH_CHARS) {
+                sb.append('\n').append(safe(() -> rr.response().bodyToString()));
+            }
+            String blob = sb.length() > MAX_SEARCH_CHARS ? sb.substring(0, MAX_SEARCH_CHARS) : sb.toString();
+            return blob.toLowerCase(Locale.ROOT);
         }
 
         private static String mimeOf(HttpResponse resp) {
@@ -1240,6 +1426,11 @@ final class UniqueRequestsViewer {
         String urlAt(int modelRow) {
             Row row = rowAt(modelRow);
             return row == null ? null : row.url;
+        }
+
+        String searchAt(int modelRow) {
+            Row row = rowAt(modelRow);
+            return row == null ? null : row.search;
         }
 
         /** Snapshot of the backing requests (for Save / live export). */

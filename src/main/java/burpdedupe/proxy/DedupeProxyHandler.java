@@ -2,6 +2,7 @@ package burpdedupe.proxy;
 
 import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.core.Annotations;
+import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.proxy.http.InterceptedResponse;
 import burp.api.montoya.proxy.http.ProxyResponseHandler;
 import burp.api.montoya.proxy.http.ProxyResponseReceivedAction;
@@ -30,15 +31,17 @@ public final class DedupeProxyHandler implements ProxyResponseHandler {
     private final AtomicBoolean enabled;
     private final AtomicBoolean colorize;
     private final AtomicBoolean preserveExistingNotes;
+    private final UniqueFeed feed;
 
     public DedupeProxyHandler(MontoyaApi api, DedupeEngine engine,
                               AtomicBoolean enabled, AtomicBoolean colorize,
-                              AtomicBoolean preserveExistingNotes) {
+                              AtomicBoolean preserveExistingNotes, UniqueFeed feed) {
         this.api = api;
         this.engine = engine;
         this.enabled = enabled;
         this.colorize = colorize;
         this.preserveExistingNotes = preserveExistingNotes;
+        this.feed = feed;
     }
 
     @Override
@@ -49,7 +52,16 @@ public final class DedupeProxyHandler implements ProxyResponseHandler {
 
         DedupeEngine.Result result;
         try {
-            result = engine.classify(response.initiatingRequest(), response);
+            // Attacker/victim role ports (PORT_RULES) dedupe across identities: the same request from
+            // either login shares one count, so the victim's repeat of an attacker-seen endpoint becomes
+            // DUPE x2. Cookie / Authorization / the injected tag header and the response status are
+            // ignored for the signature. Everything else dedupes normally.
+            if (PortHighlightHandler.isRolePort(response.listenerInterface())) {
+                result = engine.classifyCrossIdentity(
+                        response.initiatingRequest(), PortHighlightHandler.injectedHeaderNames());
+            } else {
+                result = engine.classify(response.initiatingRequest(), response);
+            }
         } catch (RuntimeException e) {
             // Never let a bug here block traffic.
             api.logging().logToError("[burp-dedupe] classify failed: " + e);
@@ -75,6 +87,19 @@ public final class DedupeProxyHandler implements ProxyResponseHandler {
             // to the default yellow=unique / gray=dupe.
             updated = updated.withHighlightColor(
                     PortHighlightHandler.colorFor(response.listenerInterface(), result.verdict()));
+        }
+
+        // Push every UNIQUE straight to the live view, in memory — the live "Dedupe Live" tab no
+        // longer depends on re-reading these notes back out of Proxy history (which breaks if another
+        // extension overwrites the Notes, or annotations don't round-trip). The tab still polls
+        // history as a back-fill and dedupes the two paths by the proxy message id.
+        if (feed != null && result.verdict() == DedupeEngine.Verdict.UNIQUE) {
+            try {
+                feed.publish(HttpRequestResponse.httpRequestResponse(
+                        response.initiatingRequest(), response, updated), response.messageId());
+            } catch (RuntimeException e) {
+                api.logging().logToError("[burp-dedupe] live publish failed: " + e);
+            }
         }
 
         return ProxyResponseReceivedAction.continueWith(response, updated);

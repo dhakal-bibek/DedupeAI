@@ -72,7 +72,13 @@ public final class HistoryStamper {
             DedupeEngine.Result result;
             try {
                 if (!entry.hasResponse()) { skipped++; continue; }
-                result = engine.classify(entry.finalRequest(), entry.response());
+                // Match the live handler: role-port (attacker/victim) entries dedupe across identities.
+                if (PortHighlightHandler.isRolePort(entry.listenerPort())) {
+                    result = engine.classifyCrossIdentity(
+                            entry.finalRequest(), PortHighlightHandler.injectedHeaderNames());
+                } else {
+                    result = engine.classify(entry.finalRequest(), entry.response());
+                }
             } catch (RuntimeException e) {
                 api.logging().logToError("[burp-dedupe] classify-history failed for entry "
                         + entry.id() + ": " + e);

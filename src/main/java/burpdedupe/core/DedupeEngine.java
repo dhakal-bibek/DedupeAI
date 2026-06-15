@@ -12,6 +12,7 @@ import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -60,6 +61,8 @@ public final class DedupeEngine {
             ".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico",
             ".woff", ".woff2", ".ttf", ".eot", ".otf", ".map", ".mp4", ".mp3"
     };
+    /** Per-identity request headers dropped before a cross-identity signature (attacker/victim share a count). */
+    private static final String[] IDENTITY_HEADERS = {"Cookie", "Authorization"};
 
     private final MontoyaApi api;
     private final AtomicReference<SignatureConfig> configRef;
@@ -146,6 +149,26 @@ public final class DedupeEngine {
         int n = existing.incrementAndGet();
         totalDupes.incrementAndGet();
         return new Result(Verdict.DUPE, sig, n);
+    }
+
+    /**
+     * Classify with an <b>identity-agnostic</b> signature, for multi-identity (attacker/victim) testing.
+     * The request's {@code Cookie} / {@code Authorization} and the given tag headers are dropped, and the
+     * response is ignored (no status / Content-Type), so the <em>same request</em> sent by different
+     * logins through the attacker and victim proxies shares one count — first = UNIQUE, second+ = DUPE xN.
+     * Everything else (method / host / path / param names per the active config) is unchanged.
+     */
+    public Result classifyCrossIdentity(HttpRequest request, Set<String> stripHeaderNames) {
+        HttpRequest req = request;
+        for (String name : IDENTITY_HEADERS) {
+            if (req.hasHeader(name)) req = req.withRemovedHeader(name);
+        }
+        if (stripHeaderNames != null) {
+            for (String name : stripHeaderNames) {
+                if (req.hasHeader(name)) req = req.withRemovedHeader(name);
+            }
+        }
+        return classify(req, null); // null response → status & Content-Type excluded from the signature
     }
 
     private static boolean isStaticAsset(HttpRequest req) {
@@ -245,6 +268,11 @@ public final class DedupeEngine {
         List<String> bodyTokens = new ArrayList<>(8);
         List<String> cookieTokens = new ArrayList<>(4);
 
+        // A param is in the signature if its names OR its values toggle is on (values implies the name);
+        // ticking "values" alone used to be a no-op because inclusion was gated on the names flag only.
+        boolean wantQuery = cfg.includeQueryParamNames || cfg.includeQueryParamValues;
+        boolean wantBody  = cfg.includeBodyParamNames  || cfg.includeBodyParamValues;
+
         for (ParsedHttpParameter p : params) {
             HttpParameterType type = p.type();
             String name = p.name();
@@ -255,11 +283,11 @@ public final class DedupeEngine {
                     || type == HttpParameterType.XML || type == HttpParameterType.MULTIPART_ATTRIBUTE;
             boolean isCookie = type == HttpParameterType.COOKIE;
 
-            if (isQuery && cfg.includeQueryParamNames) {
+            if (isQuery && wantQuery) {
                 queryTokens.add(cfg.includeQueryParamValues ? name + "=" + safeValue(p) : name);
-            } else if (isBody && cfg.includeBodyParamNames) {
+            } else if (isBody && wantBody) {
                 bodyTokens.add(cfg.includeBodyParamValues ? name + "=" + safeValue(p) : name);
-            } else if (isCookie && cfg.includeBodyParamNames) {
+            } else if (isCookie && wantBody) {
                 // Treat cookies as part of body-param toggle by convention. Off by default
                 // because cookies often vary per session and would inflate uniqueness.
                 cookieTokens.add(name);
