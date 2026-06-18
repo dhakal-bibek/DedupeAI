@@ -9,6 +9,7 @@ import burp.api.montoya.ui.editor.HttpResponseEditor;
 import burp.api.montoya.ui.editor.extension.EditorCreationContext;
 import burp.api.montoya.ui.editor.extension.ExtensionProvidedHttpResponseEditor;
 import burp.api.montoya.ui.editor.extension.HttpResponseEditorProvider;
+import burpdedupe.core.JsonPretty;
 
 import java.awt.Component;
 import java.nio.charset.StandardCharsets;
@@ -79,10 +80,11 @@ public final class BodyOnlyResponseEditor implements ExtensionProvidedHttpRespon
             return;
         }
         try {
-            String body = stripJsonGuards(resp.bodyToString()).strip();
-            String contentType = looksLikeJson(body) ? "application/json" : "text/plain; charset=utf-8";
+            String body = JsonPretty.prettyBody(resp.bodyToString());   // strip XSSI guards + pretty-print JSON
+            String contentType = JsonPretty.looksLikeJson(body) ? "application/json" : "text/plain; charset=utf-8";
             int len = body.getBytes(StandardCharsets.UTF_8).length;
-            // Synthetic response with no original headers: Burp's Pretty view formats the JSON for us.
+            // Synthetic response with no original headers: the body is already pretty-printed, and
+            // application/json lets Burp's Pretty view colourise it too.
             inner.setResponse(HttpResponse.httpResponse(
                     "HTTP/1.1 200 OK\r\nContent-Type: " + contentType + "\r\nContent-Length: " + len
                             + "\r\n\r\n" + body));
@@ -92,23 +94,4 @@ public final class BodyOnlyResponseEditor implements ExtensionProvidedHttpRespon
         }
     }
 
-    /** Strips the common anti-JSON-hijacking guards (XSSI prefixes) from the start of a body. */
-    private static String stripJsonGuards(String body) {
-        if (body == null) return "";
-        String[] guards = {
-                "^\\s*for\\s*\\(\\s*;\\s*;\\s*\\)\\s*;\\s*",   // for(;;);
-                "^\\s*while\\s*\\(\\s*1\\s*\\)\\s*;\\s*",        // while(1);
-                "^\\s*\\)\\]\\}'\\s*",                            // )]}'
-                "^\\s*/\\*\\*/\\s*"                                // /**/
-        };
-        for (String g : guards) {
-            body = body.replaceFirst(g, "");
-        }
-        return body;
-    }
-
-    private static boolean looksLikeJson(String body) {
-        String b = body.strip();
-        return b.startsWith("{") || b.startsWith("[");
-    }
 }

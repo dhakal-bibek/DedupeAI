@@ -13,6 +13,7 @@ import burp.api.montoya.proxy.ProxyHttpRequestResponse;
 import burp.api.montoya.ui.editor.EditorOptions;
 import burp.api.montoya.ui.editor.HttpRequestEditor;
 import burp.api.montoya.ui.editor.HttpResponseEditor;
+import burpdedupe.core.JsonPretty;
 import burpdedupe.proxy.DedupeProxyHandler;
 import burpdedupe.proxy.UniqueFeed;
 
@@ -821,18 +822,30 @@ final class UniqueRequestsViewer {
         List<HttpRequestResponse> sel = selectedRows();
         if (sel.isEmpty()) { status.setText("Select one or more requests first."); return; }
 
+        Preferences prefs = api.persistence().preferences();
         JFileChooser chooser = new JFileChooser();
         chooser.setDialogTitle("Save " + sel.size() + " request(s) to one .http file");
         chooser.setCurrentDirectory(new File(System.getProperty("user.home", ".")));
         String defName = sel.size() == 1 ? suggestFileName(sel.get(0).request()) : "requests-" + sel.size() + ".http";
         chooser.setSelectedFile(new File(defName));
+
+        // Option (remembered): write each response as body-only pretty JSON instead of the full raw response.
+        JCheckBox prettyBody = new JCheckBox("Responses: body only, pretty JSON",
+                boolDefault(prefs.getBoolean(PREF_SAVE_PRETTY_BODY), false));
+        prettyBody.setToolTipText("Save each response as just its body, with JSON XSSI guards stripped and the "
+                + "JSON pretty-printed (headers omitted) — cleaner for AI. Off = the full raw response.");
+        chooser.setAccessory(prettyBody);
+
         if (chooser.showSaveDialog(table) != JFileChooser.APPROVE_OPTION) return;
+        boolean bodyOnly = prettyBody.isSelected();
+        prefs.setBoolean(PREF_SAVE_PRETTY_BODY, bodyOnly);
 
         File target = chooser.getSelectedFile();
         try {
             Files.writeString(target.toPath(),
-                    "# burp-dedupe — " + sel.size() + " saved request(s) for AI\n" + AI_PROTOCOL + "\n"
-                            + buildHttpDump(sel), StandardCharsets.UTF_8);
+                    "# burp-dedupe — " + sel.size() + " saved request(s) for AI"
+                            + (bodyOnly ? " (responses: body only, pretty JSON)" : "") + "\n" + AI_PROTOCOL + "\n"
+                            + buildHttpDump(sel, bodyOnly), StandardCharsets.UTF_8);
             status.setText("Saved " + sel.size() + " request(s) to " + target.getAbsolutePath());
             api.logging().logToOutput("[burp-dedupe] saved " + sel.size() + " request(s) to " + target.getAbsolutePath());
             log("Saved " + sel.size() + " request(s) to " + target.getName());
@@ -846,6 +859,9 @@ final class UniqueRequestsViewer {
     // ── Magic Cookie: reissue the selection with a swapped-in auth set ────────
 
     private static final String PREF_MAGIC_COOKIE = "burp-dedupe.magic-cookie.headers";
+
+    /** Remembers the Save-for-AI "body only, pretty JSON" checkbox across saves/restarts. */
+    private static final String PREF_SAVE_PRETTY_BODY = "burp-dedupe.save.pretty-body-only";
 
     /** Shown until an auth set is saved. Parses to zero headers (every line is a comment). */
     private static final String DEFAULT_MAGIC_HINT =
@@ -1170,6 +1186,16 @@ final class UniqueRequestsViewer {
 
     /** Builds the multi-request {@code .http} dump (each request + response in a ####-delimited section). */
     private static String buildHttpDump(List<HttpRequestResponse> rrs) {
+        return buildHttpDump(rrs, false);
+    }
+
+    /**
+     * Builds the multi-request {@code .http} dump (each request + response in a ####-delimited section,
+     * each prefixed with its case manifest). When {@code prettyBodyOnlyResponses} is set, every response
+     * is written as just its body — XSSI guards stripped and JSON pretty-printed — instead of the full
+     * raw response, which is cleaner for an AI to read.
+     */
+    private static String buildHttpDump(List<HttpRequestResponse> rrs, boolean prettyBodyOnlyResponses) {
         StringBuilder sb = new StringBuilder();
         int n = 0;
         for (HttpRequestResponse rr : rrs) {
@@ -1185,7 +1211,12 @@ final class UniqueRequestsViewer {
             sb.append(caseManifest(req, rr));
             sb.append("===== REQUEST =====\n").append(safe(() -> req.toByteArray().toString()));
             if (rr.hasResponse() && rr.response() != null) {
-                sb.append("\n\n===== RESPONSE =====\n").append(safe(() -> rr.response().toByteArray().toString()));
+                if (prettyBodyOnlyResponses) {
+                    sb.append("\n\n===== RESPONSE (body only, pretty JSON) =====\n")
+                            .append(safe(() -> JsonPretty.prettyBody(rr.response().bodyToString())));
+                } else {
+                    sb.append("\n\n===== RESPONSE =====\n").append(safe(() -> rr.response().toByteArray().toString()));
+                }
             }
             sb.append("\n\n");
         }
