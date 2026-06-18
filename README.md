@@ -1,6 +1,6 @@
 # DedupeAI
 
-Burp Suite extension (Montoya API) that turns noisy HTTP history into a **deduplicated, AI-ready** attack surface. It stamps every new proxy entry **UNIQUE** or **DUPE**, streams the unique ones into a live feed, color-codes attacker/victim traffic by listener port, and hands the deduped set straight to **Claude Code / AI** through a file bridge — with IDOR/BOLA tooling built in.
+Burp Suite extension (Montoya API) that turns noisy HTTP history into a **deduplicated, AI-ready** attack surface. It stamps every new proxy entry **UNIQUE** or **DUPE**, streams the unique ones into a live feed, color-codes attacker/victim traffic by listener port — a **port-based highlighter** (PwnFox-style, but keyed on the proxy listener port) built for **Android/iOS** multi-account testing — and hands the deduped set straight to **Claude Code / AI** through a file bridge, with **IDOR/BOLA** tooling built in.
 
 ![DedupeAI — the Dedupe Live feed with attacker (green) / victim (red) tagging and an inline Repeater](assets/dedupe-live.png)
 
