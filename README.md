@@ -13,6 +13,7 @@ Burp Suite extension (Montoya API) that turns noisy HTTP history into a **dedupl
 - **AI bridge** — **Save request(s) for AI** and **Live export → file** mirror the unique set to `~/.burp-dedupe/<project>/live-unique.http` so Claude Code can read it (Burp's MCP can't see a custom extension window, so the filesystem is the shared channel).
 - **Inline Repeater** — edit and resend any logged unique without leaving the view.
 - **Send unique to Organizer** — push only the uniques (dupes filtered) to Burp Organizer, with optional header overrides.
+- **Body Only (Pretty JSON)** — a read-only response-viewer tab (Proxy / Repeater / anywhere) that shows *just* the body with JSON XSSI guards (`)]}'`, `for(;;);`, `while(1);`) stripped and the JSON pretty-rendered.
 
 ## How it works
 
@@ -194,4 +195,5 @@ In the Dedupe tab's **Header overrides** section:
 
 ## Acknowledgements
 
-The per-request **[case manifest](#case-manifest-per-request)** in the AI export — source request, identity role, why it's unique, a replay command, and the expected safe failure — was suggested by **[Timur Yessenov (@Timur_Yessenov)](https://x.com/Timur_Yessenov)**. Thanks for the idea that turns the export into a proper case file instead of a bucket of HTTP noise.
+- The per-request **[case manifest](#case-manifest-per-request)** in the AI export — source request, identity role, why it's unique, a replay command, and the expected safe failure — was suggested by **[Timur Yessenov (@Timur_Yessenov)](https://x.com/Timur_Yessenov)**. Thanks for the idea that turns the export into a proper case file instead of a bucket of HTTP noise.
+- The **Body Only (Pretty JSON)** response tab is a Montoya port of **[rikeshbaniya](https://github.com/rikeshbaniya)**'s Burp extension of the same name — it strips headers + JSON XSSI guards and pretty-renders the body. Thanks!

@@ -12,6 +12,7 @@ import burpdedupe.proxy.DedupeProxyHandler;
 import burpdedupe.proxy.HistoryStamper;
 import burpdedupe.proxy.PortHighlightHandler;
 import burpdedupe.proxy.UniqueFeed;
+import burpdedupe.ui.BodyOnlyResponseEditor;
 import burpdedupe.ui.DedupeContextMenu;
 import burpdedupe.ui.DedupeTab;
 
@@ -55,6 +56,10 @@ public class BurpDedupeExtension implements BurpExtension {
 
             DedupeContextMenu contextMenu = new DedupeContextMenu(api, engine, stamper, tab::currentOverrides);
             api.userInterface().registerContextMenuItemsProvider(contextMenu);
+
+            // "Body Only" response tab — strips headers + JSON XSSI guards and pretty-renders the body
+            // (a Montoya port of rikeshbaniya's "Body Only (Pretty JSON)"; see README Acknowledgements).
+            api.userInterface().registerHttpResponseEditorProvider(new BodyOnlyResponseEditor.Provider(api));
 
             // Ctrl+9 (in Proxy HTTP history or the Site map): if rows are selected (e.g. Ctrl+A),
             // open the unique requests from that selection; with nothing selected, fall back to the
