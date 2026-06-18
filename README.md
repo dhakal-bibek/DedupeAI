@@ -34,6 +34,8 @@ Burp Suite extension (Montoya API) that turns noisy HTTP history into a **dedupl
 
 - Because color is verdict-aware, it's applied after classification — so the "Highlight rows" / "Stamp Notes" toggles must be on for colors to show.
 
+![Multi-account IDOR/BOLA in DedupeAI — attacker traffic (green, port 8082) vs victim (red, port 8083), replaying a captured request with the victim's session (`X-AI-Use: victim`) in the inline Repeater](assets/idor-bola.png)
+
 ## Build
 
 Requires JDK 21+.
