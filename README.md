@@ -1,6 +1,18 @@
-# Burp Dedupe
+# DedupeAI
 
-Burp Suite extension (Montoya API) that classifies each new HTTP-history entry as **UNIQUE** or **DUPE** and writes the verdict to the Notes column. Sort the Notes column → all unique rows cluster together → mass-select and feed to your scanners or other extensions.
+Burp Suite extension (Montoya API) that turns noisy HTTP history into a **deduplicated, AI-ready** attack surface. It stamps every new proxy entry **UNIQUE** or **DUPE**, streams the unique ones into a live feed, color-codes attacker/victim traffic by listener port, and hands the deduped set straight to **Claude Code / AI** through a file bridge — with IDOR/BOLA tooling built in.
+
+![DedupeAI — the Dedupe Live feed with attacker (green) / victim (red) tagging and an inline Repeater](assets/dedupe-live.png)
+
+## Features
+
+- **Dedupe** — every HTTP-history entry is stamped `[DEDUPE] UNIQUE` / `[DEDUPE] DUPE xN` in the Notes column (configurable signature). Sort the Notes column → all unique rows cluster → mass-select and feed your scanners or other extensions.
+- **Dedupe Live tab** — an always-on, auto-refreshing feed of *just* the unique requests, no selection needed.
+- **Attacker / victim tagging** — injects `X-AI-Use: attacker|victim` by listener port and colors rows per port **and** verdict (green / yellow / red / gray) for multi-account IDOR/BOLA testing.
+- **IDOR/BOLA tools** — **Magic Cookie** (replay a request with another identity's session) and **Match & Replace** (swap an object id and watch for an unexpected `200`), right from the unique feed.
+- **AI bridge** — **Save request(s) for AI** and **Live export → file** mirror the unique set to `~/.burp-dedupe/<project>/live-unique.http` so Claude Code can read it (Burp's MCP can't see a custom extension window, so the filesystem is the shared channel).
+- **Inline Repeater** — edit and resend any logged unique without leaving the view.
+- **Send unique to Organizer** — push only the uniques (dupes filtered) to Burp Organizer, with optional header overrides.
 
 ## How it works
 
@@ -56,7 +68,7 @@ Select rows, right-click → **Dedupe**:
   - This is a **snapshot** of the current selection (also on **Ctrl+9** with rows selected). For an auto-updating view, use the **Dedupe Live** tab or the **Live unique window** (below).
   - The table is **multi-select** (Ctrl/Cmd- or Shift-click). Toolbar actions apply to the whole selection.
   - **Send to Repeater** — sends each selected request to a new Repeater tab, **named by its method + path** (e.g. `GET /test/lasd/something/234`, `POST /sdfsd/dff`) so tabs are easy to tell apart. (Tip: point [Autorize](https://github.com/Quitten/Autorize) at Repeater and hit Send to run its authz checks.)
-  - **Save request(s)** — saves all selected requests **and their responses into one `.http` file** (each in its own `####` section); pick the destination in the save dialog.
+  - **Save request(s) for AI** — saves all selected requests **and their responses into one `.http` file** (each in its own `####` section) for Claude Code / AI to read; pick the destination in the save dialog.
   - **Magic Cookie** — reissues the selected request(s) with a user-supplied **auth set** (cookies / bearer token / custom headers) swapped in. It strips the request's existing `Cookie` and `Authorization` (plus any header you list) and sends with **only** the credentials you provide — method, path, body and every other header unchanged. You enter the auth set once in a dialog (one `Name: value` per line) and it's remembered across windows and restarts (Montoya preferences); results open in their own window so you can compare statuses. Ideal for same-request / different-identity **IDOR/BOLA** checks (e.g. replay an attacker's request with the victim's session and watch for a `200`).
   - **Match & Replace (IDOR)** — reissues the selected request(s) with a find/replace applied to the **path/query**, the **body**, or **both** (literal, or tick **regex**). Built for IDOR/BOLA: swap an object id (e.g. `1001`→`1002`) and watch the results for a `200` where another identity's value should be denied. **Only requests that actually contain the match are reissued** — the rest are skipped, so you hit only the endpoints carrying that id, with just the id changed. Method, headers and untouched parts go out as-is (`Content-Length` is refreshed for you). The match/replace/scope settings are remembered (Montoya preferences).
   - **Clear** — empties this window (the collected rows). In the live window, new `[DEDUPE] UNIQUE` requests keep arriving after; already-cleared rows don't reappear.
@@ -74,7 +86,7 @@ Two ways in, same real-time view — **no selection needed**:
 
 It's an HTTP-history-style view that **automatically collects every Proxy HTTP-history entry stamped `[DEDUPE] UNIQUE`** in its Notes — and only those. New uniques appear on their own as you browse (it refreshes a couple of times a second, scanning history **incrementally** so it stays smooth even when history is large); the duplicates Burp already folded away (`[DEDUPE] DUPE …`) never show, and uniques already in history are collected the moment you open it.
 
-The toolbar acts on the multi-selected rows: **Send to Repeater**, **In-scope only** (keep only rows whose URL is in Target scope), **Save**, **Magic Cookie**, **Match & Replace**, **Clear**, **Live export → file**, and a **filter** box (substring or regex).
+The toolbar acts on the multi-selected rows: **Send to Repeater**, **In-scope only** (keep only rows whose URL is in Target scope), **Save request(s) for AI**, **Magic Cookie**, **Match & Replace**, **Clear**, **Live export → file**, and a **filter** box (substring or regex).
 
 **Inline repeater:** select a row to load it into the **editable** request editor beneath the table, tweak it, then **Send ▶** — or **Ctrl+Space** / **Cmd+Enter**. The response shows on the right with a status / length / timing line, so you can modify a logged request and resend without leaving the view (it uses Burp's HTTP client, so it lands in **Logger**, not Proxy history). On macOS, Ctrl+Space may be reserved for input-source switching — use **Cmd+Enter** there.
 

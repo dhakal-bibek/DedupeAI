@@ -83,7 +83,7 @@ import java.util.regex.PatternSyntaxException;
  * rows tinted by their Burp highlight colour). Read-only request/response viewers sit
  * beneath the table.
  *
- * <p>The toolbar has <b>Send to Repeater</b>, <b>Save</b>, a <b>Magic Cookie</b> action
+ * <p>The toolbar has <b>Send to Repeater</b>, <b>Save for AI</b>, a <b>Magic Cookie</b> action
  * (reissue the selection with a user-supplied auth set swapped in — for same-request,
  * different-identity IDOR/BOLA checks), and a <b>filter</b> box that
  * matches across all columns (substring, or a regular expression when "regex" is
@@ -231,9 +231,9 @@ final class UniqueRequestsViewer {
         repeater.setToolTipText("Send the selected request(s) to new Repeater tabs (named by method + path).");
         repeater.addActionListener(e -> sendSelectedToRepeater());
 
-        JButton save = new JButton("Save request(s)");
-        save.setToolTipText("Save the selected request(s) and their responses into one .http file. "
-                + "Ctrl/Cmd- or Shift-click to select several.");
+        JButton save = new JButton("Save request(s) for AI");
+        save.setToolTipText("Save the selected request(s) and their responses into one .http file "
+                + "for Claude Code / AI to read. Ctrl/Cmd- or Shift-click to select several.");
         save.addActionListener(e -> saveSelectedRequests());
 
         JButton magic = new JButton("Magic Cookie");
