@@ -34,6 +34,8 @@ Burp Suite extension (Montoya API) that turns noisy HTTP history into a **dedupl
 
 - Because color is verdict-aware, it's applied after classification — so the "Highlight rows" / "Stamp Notes" toggles must be on for colors to show.
 
+![DEDUPE verdicts and attacker/victim port tags in Burp's HTTP history — [DEDUPE] UNIQUE / DUPE xN in the Notes column, rows colored per port and verdict (attacker green/yellow on 8082, victim red/gray on 8083)](assets/history-verdicts.png)
+
 ![Multi-account IDOR/BOLA in DedupeAI — attacker traffic (green, port 8082) vs victim (red, port 8083), replaying a captured request with the victim's session (`X-AI-Use: victim`) in the inline Repeater](assets/idor-bola.png)
 
 ## Build
@@ -110,6 +112,8 @@ The folder is named after the **current Burp project** (`api.project().name()`),
 
 **Workflow:** open the **Dedupe Live** tab (or the Ctrl+9 window) → it fills with `[DEDUPE] UNIQUE` requests and mirrors them automatically → in **Claude Code**: *"read `~/.burp-dedupe/<project>/live-unique.http`"* for the full deduped set, or `selection.http` for just what you've highlighted. The folder path is logged to the extension's **Output** on open and shown in the **status bar** after each write.
 
+![The AI bridge on disk — ~/.burp-dedupe/<project>/ holds live-unique.http and selection.http, each a ####-delimited request+response block, ready for Claude Code to read](assets/ai-export.png)
+
 ## Presets
 
 | Preset | What it considers unique |
@@ -126,9 +130,13 @@ The folder is named after the **current Burp project** (`api.project().name()`),
 | Strict | full URL + all params + values + status + content-type |
 | Custom | whatever you tick |
 
+![The Dedupe config tab — pick a Preset (or tick individual signature fields), set filters and the memory cap, paste header overrides, and watch live stats](assets/dedupe-config.png)
+
 ## Send unique to Organizer (right-click)
 
 The main action: in **HTTP history**, select any number of rows (duplicates fine), right-click → **Dedupe → Send unique to Organizer**. The extension:
+
+![Right-click path: select rows in HTTP history → Extensions → Dedupe → Send unique to Organizer (here 11 selected); the Dedupe submenu also offers the live window and the Ctrl+9 snapshot](assets/send-to-organizer.png)
 
 1. Recomputes signatures for the selection using the current signature config (stamps in the Notes column are not required — uniqueness is determined live).
 2. Keeps the first occurrence of each signature, drops the rest.
