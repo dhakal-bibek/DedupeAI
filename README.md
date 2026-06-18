@@ -108,9 +108,36 @@ Burp's MCP server can't see a custom extension window, so to hand your deduped r
   selection.http     ← just the rows you currently have selected
 ```
 
-The folder is named after the **current Burp project** (`api.project().name()`), so each engagement gets its own. Each entry is the request **and** its response in a `####`-delimited block, with a header line (project / time / count). The toggle is **on by default in the live window** (off in snapshot/results windows so they don't overwrite the files — flip it on there for a one-off).
+The folder is named after the **current Burp project** (`api.project().name()`), so each engagement gets its own. Each entry is the request **and** its response in a `####`-delimited block, **prefixed with a [case manifest](#case-manifest-per-request)**; the file opens with a one-line protocol telling the AI to read the manifest and explain the risk before touching payloads. The toggle is **on by default in the live window** (off in snapshot/results windows so they don't overwrite the files — flip it on there for a one-off).
 
 **Workflow:** open the **Dedupe Live** tab (or the Ctrl+9 window) → it fills with `[DEDUPE] UNIQUE` requests and mirrors them automatically → in **Claude Code**: *"read `~/.burp-dedupe/<project>/live-unique.http`"* for the full deduped set, or `selection.http` for just what you've highlighted. The folder path is logged to the extension's **Output** on open and shown in the **status bar** after each write.
+
+### Case manifest (per request)
+
+So the AI gets a **case file, not a bucket of HTTP noise**, every exported request is prefixed with a `#`-commented **manifest** — un-skippable, it rides in front of every block:
+
+1. **Source request** — method + URL.
+2. **Identity role** — `attacker` / `victim`, from the `X-AI-Use` header or the `[attacker]/[victim] port N` tag.
+3. **Why it's unique** — the dedupe verdict and what the signature keyed on.
+4. **Replay command** — a ready-to-run `curl` (auth + body included).
+5. **Expected safe failure** — the IDOR/BOLA oracle: replayed under a *different* identity it should be denied (`401/403/404`); a `200` returning the other identity's data is the finding.
+
+```
+# --- CASE MANIFEST (read before touching payloads) ------------------------
+# 1. Source request : POST https://api-m.paypal.com/v1/tracking/batch/events
+# 2. Identity role  : victim  (X-AI-Use: victim, proxy listener port 8083)
+# 3. Why unique     : [DEDUPE] UNIQUE — first request with this signature (method + host + path +
+#                     sorted param names + status, per the active preset); its duplicates were folded out.
+# 4. Replay command : curl -isSk -X POST 'https://api-m.paypal.com/v1/tracking/batch/events' -H 'Cookie: ...' --data-raw '...'
+# 5. Expected safe  : original response 200; replayed under a DIFFERENT identity this should be DENIED —
+#                     expect 401/403/404. A 200 returning the other identity's data is the finding.
+# --------------------------------------------------------------------------
+===== REQUEST =====
+POST /v1/tracking/batch/events HTTP/2
+...
+```
+
+*Manifest format suggested by [Timur Yessenov (@Timur_Yessenov)](https://x.com/Timur_Yessenov) — thanks!*
 
 ![The AI bridge on disk — ~/.burp-dedupe/<project>/ holds live-unique.http and selection.http, each a ####-delimited request+response block, ready for Claude Code to read](assets/ai-export.png)
 
@@ -164,3 +191,7 @@ In the Dedupe tab's **Header overrides** section:
 - **Out-of-scope**: enable "In-scope only" to skip everything not in target scope.
 - **Path normalization** (numeric IDs → `{n}`, UUIDs → `{uuid}`, long hex → `{hex}`) is opt-in per preset; turn it on for IDOR / path traversal.
 - Header inclusion: free-text field (comma-separated, lowercase) — useful to include `host` aliases on Host header attacks, etc.
+
+## Acknowledgements
+
+The per-request **[case manifest](#case-manifest-per-request)** in the AI export — source request, identity role, why it's unique, a replay command, and the expected safe failure — was suggested by **[Timur Yessenov (@Timur_Yessenov)](https://x.com/Timur_Yessenov)**. Thanks for the idea that turns the export into a proper case file instead of a bucket of HTTP noise.

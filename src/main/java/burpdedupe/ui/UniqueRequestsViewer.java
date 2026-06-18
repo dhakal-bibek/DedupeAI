@@ -830,7 +830,9 @@ final class UniqueRequestsViewer {
 
         File target = chooser.getSelectedFile();
         try {
-            Files.writeString(target.toPath(), buildHttpDump(sel), StandardCharsets.UTF_8);
+            Files.writeString(target.toPath(),
+                    "# burp-dedupe — " + sel.size() + " saved request(s) for AI\n" + AI_PROTOCOL + "\n"
+                            + buildHttpDump(sel), StandardCharsets.UTF_8);
             status.setText("Saved " + sel.size() + " request(s) to " + target.getAbsolutePath());
             api.logging().logToOutput("[burp-dedupe] saved " + sel.size() + " request(s) to " + target.getAbsolutePath());
             log("Saved " + sel.size() + " request(s) to " + target.getName());
@@ -1180,6 +1182,7 @@ final class UniqueRequestsViewer {
                 sb.append("  -> ").append(safe(() -> Short.toString(rr.response().statusCode())));
             }
             sb.append(" ########################\n");
+            sb.append(caseManifest(req, rr));
             sb.append("===== REQUEST =====\n").append(safe(() -> req.toByteArray().toString()));
             if (rr.hasResponse() && rr.response() != null) {
                 sb.append("\n\n===== RESPONSE =====\n").append(safe(() -> rr.response().toByteArray().toString()));
@@ -1187,6 +1190,158 @@ final class UniqueRequestsViewer {
             sb.append("\n\n");
         }
         return sb.toString();
+    }
+
+    // ── Case manifest: a per-request "case file" header for AI/agent consumption ──
+    //    (Five-field format suggested by Timur Yessenov — see README Acknowledgements.)
+
+    /** Request-body length above which the replay curl drops the inline body, to keep the manifest readable. */
+    private static final int CURL_BODY_CAP = 4_000;
+
+    /**
+     * Prepended to every export file: each case carries a manifest, and the agent must read it and
+     * explain the risk before mutating or sending the payload. Makes the discipline un-skippable.
+     */
+    private static final String AI_PROTOCOL =
+            "# Each case below carries a CASE MANIFEST (source request, identity role, why it's unique,\n"
+          + "# a replay command, and the expected safe failure). AI/agent: read a case's manifest and\n"
+          + "# explain its risk BEFORE you modify or send its payload. Replay under a different identity\n"
+          + "# expecting denial (401/403/404); an authorized-looking 200 for another identity's data is\n"
+          + "# the finding.\n";
+
+    /**
+     * Builds the per-case manifest block (Timur Yessenov's idea): the five fields that turn a bare
+     * request into a self-contained case file — source request, identity role, why it's unique, a
+     * replay command, and the expected safe failure (the IDOR/BOLA oracle). Emitted as {@code #}-comment
+     * lines so it rides in front of every block without being mistaken for the request itself.
+     */
+    private static String caseManifest(HttpRequest req, HttpRequestResponse rr) {
+        String notes = notesText(rr);
+        String role = resolveRole(req, notes);                 // attacker / victim / custom / null
+        String port = firstGroup(notes, "port\\s+(\\d+)");
+        boolean fromHeader = headerVal(req, "X-AI-Use") != null;
+
+        String identity = role == null
+                ? "unknown — no X-AI-Use header or [attacker]/[victim] tag"
+                : role + "  (" + (fromHeader ? "X-AI-Use: " + role : "tagged [" + role + "]")
+                        + (port != null ? ", proxy listener port " + port : "") + ")";
+
+        String origStatus;
+        try {
+            origStatus = rr.hasResponse() && rr.response() != null
+                    ? "original response " + rr.response().statusCode()
+                    : "no original response captured";
+        } catch (RuntimeException e) {
+            origStatus = "original response unknown";
+        }
+        String oracle = role != null
+                ? origStatus + "; replayed under a DIFFERENT identity this should be DENIED — expect "
+                        + "401/403/404 (or an owner-scoped/empty result). A 200 returning the other "
+                        + "identity's data is the finding."
+                : origStatus + "; if this reaches another user's/object's data, a cross-identity replay "
+                        + "should be denied (401/403/404). An authorized-looking 200 for a resource you "
+                        + "shouldn't reach is the finding.";
+
+        return "# --- CASE MANIFEST (read before touching payloads) ------------------------\n"
+             + "# 1. Source request : " + safe(req::method) + " " + safe(req::url) + "\n"
+             + "# 2. Identity role  : " + identity + "\n"
+             + "# 3. Why unique     : " + whyUnique(notes) + "\n"
+             + "# 4. Replay command : " + curlFor(req) + "\n"
+             + "# 5. Expected safe  : " + oracle + "\n"
+             + "# --------------------------------------------------------------------------\n";
+    }
+
+    /** Plain-language "why this earns its own case file", read from the dedupe verdict in the Notes. */
+    private static String whyUnique(String notes) {
+        String low = notes == null ? "" : notes.toLowerCase(Locale.ROOT);
+        if (low.contains("unique")) {
+            return "[DEDUPE] UNIQUE — first request with this signature (method + host + path + sorted "
+                    + "param names + status, per the active preset); its duplicates were folded out.";
+        }
+        if (low.contains("dupe")) {
+            return notes.trim() + " — a duplicate of an earlier request (in the export because it was selected).";
+        }
+        return "reissued/derived request (e.g. a Magic Cookie / Match & Replace result) — not a fresh dedupe verdict.";
+    }
+
+    /** A runnable {@code curl} replay of {@code req} (auth and body included); body dropped past {@link #CURL_BODY_CAP}. */
+    private static String curlFor(HttpRequest req) {
+        if (req == null) return "(no request)";
+        StringBuilder sb = new StringBuilder(256);
+        sb.append("curl -isSk -X ").append(safe(req::method)).append(' ').append(sq(safe(req::url)));
+        try {
+            for (HttpHeader h : req.headers()) {
+                String name = h.name();
+                if (name == null || name.isEmpty() || name.equalsIgnoreCase("Content-Length")) continue;
+                sb.append(" -H ").append(sq(name + ": " + safe(h::value)));
+            }
+        } catch (RuntimeException ignored) {
+            // headers unavailable — the curl still carries method/url
+        }
+        String body = safe(req::bodyToString);
+        if (!body.isEmpty()) {
+            if (body.length() > CURL_BODY_CAP) {
+                sb.append("   # + ").append(body.length()).append("-byte body omitted — see the REQUEST block below");
+            } else {
+                sb.append(" --data-raw ").append(sq(body));
+            }
+        }
+        return sb.toString();
+    }
+
+    /** Identity role: the {@code X-AI-Use} header if present, else the {@code [attacker]/[victim]} note tag, else null. */
+    private static String resolveRole(HttpRequest req, String notes) {
+        String hdr = headerVal(req, "X-AI-Use");
+        if (hdr != null && !hdr.isBlank()) return hdr.trim().toLowerCase(Locale.ROOT);
+        return noteRole(notes);
+    }
+
+    private static String noteRole(String notes) {
+        if (notes == null) return null;
+        String low = notes.toLowerCase(Locale.ROOT);
+        if (low.contains("[attacker]")) return "attacker";
+        if (low.contains("[victim]")) return "victim";
+        return null;
+    }
+
+    /** First value of header {@code name} (case-insensitive) on {@code req}, or null — via {@code headers()} so it can't NPE on a missing accessor. */
+    private static String headerVal(HttpRequest req, String name) {
+        try {
+            if (req == null) return null;
+            for (HttpHeader h : req.headers()) {
+                if (h.name() != null && h.name().equalsIgnoreCase(name)) return h.value();
+            }
+        } catch (RuntimeException ignored) {
+            // no headers — treat as absent
+        }
+        return null;
+    }
+
+    /** First capturing group of {@code regex} in {@code s}, or null. */
+    private static String firstGroup(String s, String regex) {
+        if (s == null) return null;
+        try {
+            var m = Pattern.compile(regex).matcher(s);
+            return m.find() ? m.group(1) : null;
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /** The row's Notes text (verdict + identity tag), null-safe. */
+    private static String notesText(HttpRequestResponse rr) {
+        try {
+            Annotations a = rr == null ? null : rr.annotations();
+            return a != null && a.hasNotes() && a.notes() != null ? a.notes() : "";
+        } catch (RuntimeException e) {
+            return "";
+        }
+    }
+
+    /** Single-quotes a string for safe inclusion in a shell (curl) command. */
+    private static String sq(String s) {
+        if (s == null) return "''";
+        return "'" + s.replace("'", "'\\''") + "'";
     }
 
     // ── Live export: mirror the current selection to ~/.burp-dedupe/<project>/selection.http ──
@@ -1218,10 +1373,10 @@ final class UniqueRequestsViewer {
                     Files.createDirectories(dir);
                     writeExport(dir.resolve("live-unique.http"),
                             "# burp-dedupe live export — project: " + project + " — " + ts + " — "
-                                    + all.size() + " unique request(s)\n\n", all, "no requests yet");
+                                    + all.size() + " unique request(s)\n" + AI_PROTOCOL + "\n", all, "no requests yet");
                     writeExport(dir.resolve("selection.http"),
                             "# burp-dedupe selection — project: " + project + " — " + ts + " — "
-                                    + sel.size() + " request(s)\n\n", sel, "nothing selected");
+                                    + sel.size() + " request(s)\n" + AI_PROTOCOL + "\n", sel, "nothing selected");
                 }
                 SwingUtilities.invokeLater(() -> status.setText(
                         "Live-exported " + all.size() + " unique / " + sel.size() + " selected to " + dir));
