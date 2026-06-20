@@ -24,7 +24,7 @@ public class BurpDedupeExtension implements BurpExtension {
 
     @Override
     public void initialize(MontoyaApi api) {
-        api.extension().setName("Dedupe");
+        api.extension().setName("DedupeAI");
 
         DedupeEngine engine = new DedupeEngine(api, SignatureConfig.forPreset(SignatureConfig.Preset.DEFAULT));
         AtomicBoolean enabled = new AtomicBoolean(true);

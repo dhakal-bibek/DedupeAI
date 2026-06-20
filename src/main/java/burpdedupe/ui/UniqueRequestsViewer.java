@@ -25,7 +25,6 @@ import javax.swing.JCheckBox;
 import javax.swing.JComponent;
 import javax.swing.JDialog;
 import javax.swing.JFileChooser;
-import javax.swing.JFrame;
 import javax.swing.JLabel;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
@@ -102,7 +101,7 @@ final class UniqueRequestsViewer {
     private final HttpResponseEditor responseEditor;
     private final UniqueTableModel model;
     private final JTable table;
-    private final JFrame frame;          // null in embedded (Burp suite-tab) mode
+    private final JDialog frame;         // null in embedded (Burp suite-tab) mode; else a dialog owned by Burp's frame
     private final JPanel root;           // the content panel; becomes the tab body when embedded
     private final TableRowSorter<UniqueTableModel> sorter;
     private final JTextField filterField = new JTextField(26);
@@ -199,11 +198,14 @@ final class UniqueRequestsViewer {
         root.add(status, BorderLayout.SOUTH);
 
         if (windowed) {
-            this.frame = new JFrame("Dedupe — " + baseTitle + " (" + model.getRowCount() + ")");
+            // Parent pop-up windows to Burp's main frame (BApp Store guideline: SwingUtils.suiteFrame()),
+            // as a modeless dialog so they ride with Burp across monitors instead of floating loose.
+            java.awt.Frame owner = api.userInterface().swingUtils().suiteFrame();
+            this.frame = new JDialog(owner, "Dedupe — " + baseTitle + " (" + model.getRowCount() + ")", false);
             frame.setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
             frame.add(root);
             frame.setSize(1150, 760);
-            frame.setLocationRelativeTo(null);
+            frame.setLocationRelativeTo(owner);
             api.userInterface().applyThemeToComponent(frame.getRootPane());
         } else {
             this.frame = null;                               // embedded: this panel is a Burp suite tab

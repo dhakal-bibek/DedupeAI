@@ -195,5 +195,6 @@ In the Dedupe tab's **Header overrides** section:
 
 ## Acknowledgements
 
+- DedupeAI builds on **[burp-dedupe](https://github.com/sw33tLie/burp-dedupe)** by **sw33tLie** — the original dedupe + unique-requests core. It's MIT-licensed and that licence is retained in [`LICENSE`](LICENSE).
 - The per-request **[case manifest](#case-manifest-per-request)** in the AI export — source request, identity role, why it's unique, a replay command, and the expected safe failure — was suggested by **[Timur Yessenov (@Timur_Yessenov)](https://x.com/Timur_Yessenov)**. Thanks for the idea that turns the export into a proper case file instead of a bucket of HTTP noise.
 - The **Body Only (Pretty JSON)** response tab (and the matching Save-for-AI export option) was inspired by **[rikeshbaniya](https://github.com/rikeshbaniya)**'s Burp extension of the same name, reimplemented here with a dependency-free JSON re-indenter. Thanks for the idea!
